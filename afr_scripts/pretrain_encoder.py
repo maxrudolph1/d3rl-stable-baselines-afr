@@ -1,15 +1,24 @@
 """
-Encoder Pre-training Script for CQL
+CARDPOL: Contrastive Actor Recognition for Diverse POLicies
 
-This script pre-trains the encoder of a CQL model using a custom loss function
-on trajectories sampled from a combined MDP dataset. The pre-trained encoder
-can later be loaded to train policies offline with a different dataset.
+This script pre-trains the encoder of a CQL model using CARDPOL loss on
+trajectories sampled from a combined MDP dataset containing data from
+multiple source policies. The pre-trained encoder can later be loaded 
+to train policies offline with a different dataset.
+
+CARDPOL learns encoder representations by:
+1. Sampling pairs of observations from each trajectory (t=0 and random t)
+2. Encoding both observations
+3. Using a classifier to predict which source policy generated the trajectory
+
+This encourages the encoder to learn representations that capture
+policy-specific temporal dynamics.
 
 Usage:
-    1. Define your custom loss function in `compute_encoder_loss`
-    2. Run the pre-training loop
-    3. Save the pre-trained encoder weights
-    4. Load the encoder weights when training CQL on another dataset
+    1. Load multiple datasets from different source policies
+    2. Create a CombinedMDPDataset
+    3. Run the CARDPOL pre-training loop
+    4. Save and load the pre-trained encoder for offline policy training
 """
 
 import os
@@ -36,14 +45,132 @@ sys.path.insert(0, str(Path_root))
 from afr_scripts.extended_dataset import CombinedMDPDataset, TrajectoryBatchWithSource
 
 
+# =============================================================================
+# CARDPOL Classifier
+# =============================================================================
+
+class CARDPOLClassifier(nn.Module):
+    """
+    CARDPOL (Contrastive Actor Recognition for Diverse POLicies) classifier.
+    
+    A classifier network that takes two embeddings from the encoder and
+    outputs logits representing source_id (policy) probabilities.
+    
+    The classifier can combine the embeddings in various ways:
+    - concatenation: [emb1, emb2]
+    - difference: emb1 - emb2
+    - concatenation + difference: [emb1, emb2, emb1 - emb2]
+    
+    Args:
+        embedding_size: Size of each embedding from the encoder.
+        num_sources: Number of source datasets/policies to classify.
+        hidden_sizes: List of hidden layer sizes.
+        combine_mode: How to combine the two embeddings ('concat', 'diff', 'concat_diff').
+    """
+    
+    def __init__(
+        self,
+        embedding_size: int,
+        num_sources: int,
+        hidden_sizes: list = None,
+        combine_mode: str = "concat",
+    ):
+        super().__init__()
+        
+        if hidden_sizes is None:
+            hidden_sizes = [256, 128]
+        
+        self.combine_mode = combine_mode
+        self.embedding_size = embedding_size
+        self.num_sources = num_sources
+        
+        # Compute input size based on combine mode
+        if combine_mode == "concat":
+            input_size = embedding_size * 2
+        elif combine_mode == "diff":
+            input_size = embedding_size
+        elif combine_mode == "concat_diff":
+            input_size = embedding_size * 3
+        else:
+            raise ValueError(f"Unknown combine_mode: {combine_mode}")
+        
+        # Build MLP layers
+        layers = []
+        in_size = input_size
+        for hidden_size in hidden_sizes:
+            layers.append(nn.Linear(in_size, hidden_size))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(0.1))
+            in_size = hidden_size
+        
+        # Output layer
+        layers.append(nn.Linear(in_size, num_sources))
+        
+        self.network = nn.Sequential(*layers)
+    
+    def forward(
+        self,
+        embedding1: torch.Tensor,
+        embedding2: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Forward pass through the classifier.
+        
+        Args:
+            embedding1: First embedding, shape (batch_size, embedding_size)
+            embedding2: Second embedding, shape (batch_size, embedding_size)
+        
+        Returns:
+            Logits of shape (batch_size, num_sources)
+        """
+        if self.combine_mode == "concat":
+            combined = torch.cat([embedding1, embedding2], dim=-1)
+        elif self.combine_mode == "diff":
+            combined = embedding1 - embedding2
+        elif self.combine_mode == "concat_diff":
+            combined = torch.cat([
+                embedding1,
+                embedding2,
+                embedding1 - embedding2
+            ], dim=-1)
+        else:
+            raise ValueError(f"Unknown combine_mode: {self.combine_mode}")
+        
+        return self.network(combined)
+    
+    def predict_proba(
+        self,
+        embedding1: torch.Tensor,
+        embedding2: torch.Tensor,
+    ) -> torch.Tensor:
+        """Get probability predictions."""
+        logits = self.forward(embedding1, embedding2)
+        return torch.softmax(logits, dim=-1)
+    
+    def predict(
+        self,
+        embedding1: torch.Tensor,
+        embedding2: torch.Tensor,
+    ) -> torch.Tensor:
+        """Get class predictions."""
+        logits = self.forward(embedding1, embedding2)
+        return torch.argmax(logits, dim=-1)
+
+
 @dataclass
 class EncoderPretrainConfig:
     """Configuration for encoder pre-training."""
     # Training
     learning_rate: float = 1e-4
+    classifier_learning_rate: float = 1e-4
     batch_size: int = 32
     trajectory_length: int = 10
     n_steps: int = 100000
+    
+    # Classifier configuration
+    num_sources: int = 2
+    classifier_hidden_sizes: list = None  # Default: [256, 128]
+    classifier_combine_mode: str = "concat"  # 'concat', 'diff', or 'concat_diff'
     
     # Logging
     log_interval: int = 100
@@ -52,6 +179,10 @@ class EncoderPretrainConfig:
     
     # Device
     device: str = "cuda:0"
+    
+    def __post_init__(self):
+        if self.classifier_hidden_sizes is None:
+            self.classifier_hidden_sizes = [256, 128]
 
 
 class EncoderPretrainer:
@@ -80,14 +211,18 @@ class EncoderPretrainer:
         combined_dataset: CombinedMDPDataset,
         config: EncoderPretrainConfig,
         loss_fn: Optional[Callable] = None,
+        classifier: Optional[CARDPOLClassifier] = None,
     ):
         """
         Args:
             cql: A built DiscreteCQL model.
             combined_dataset: Combined MDP dataset for sampling trajectories.
             config: Pre-training configuration.
-            loss_fn: Custom loss function. Should accept (encoder, trajectory_batch, source_ids)
-                     and return a loss tensor. If None, uses a placeholder.
+            loss_fn: Custom loss function. Should accept 
+                     (encoder, classifier, trajectory_batch, source_ids, device)
+                     and return a loss tensor. If None, uses cardpol_loss.
+            classifier: Optional pre-initialized CARDPOLClassifier.
+                       If None, one will be created based on config.
         """
         self.cql = cql
         self.combined_dataset = combined_dataset
@@ -98,17 +233,46 @@ class EncoderPretrainer:
         # The CQL implementation stores Q-functions in _impl._modules.q_funcs
         self.encoders = self._extract_encoders()
         
+        # Get encoder feature size
+        encoder_feature_size = self._compute_encoder_feature_size()
+        
+        # Create or use provided classifier
+        if classifier is not None:
+            self.classifier = classifier.to(self.device)
+        else:
+            self.classifier = CARDPOLClassifier(
+                embedding_size=encoder_feature_size,
+                num_sources=config.num_sources,
+                hidden_sizes=config.classifier_hidden_sizes,
+                combine_mode=config.classifier_combine_mode,
+            ).to(self.device)
+        
         # Set up optimizer for encoder parameters
         encoder_params = []
         for encoder in self.encoders:
             encoder_params.extend(encoder.parameters())
-        self.optimizer = optim.Adam(encoder_params, lr=config.learning_rate)
+        self.encoder_optimizer = optim.Adam(encoder_params, lr=config.learning_rate)
         
-        # Loss function (user-defined or placeholder)
-        self.loss_fn = loss_fn or self._placeholder_loss
+        # Set up optimizer for classifier parameters
+        self.classifier_optimizer = optim.Adam(
+            self.classifier.parameters(), 
+            lr=config.classifier_learning_rate
+        )
+        
+        # Loss function (user-defined or default pairwise source prediction)
+        self.loss_fn = loss_fn or cardpol_loss
         
         # Logging
         self.writer = SummaryWriter(config.log_dir)
+    
+    def _compute_encoder_feature_size(self) -> int:
+        """Compute the output feature size of the encoder."""
+        encoder = self.encoders[0]
+        with torch.no_grad():
+            obs_shape = self.cql._impl.observation_shape
+            dummy_input = torch.zeros(1, *obs_shape, device=self.device)
+            output = encoder(dummy_input)
+        return output.shape[-1]
         
     def _extract_encoders(self) -> list:
         """Extract encoder modules from CQL's Q-functions."""
@@ -138,59 +302,6 @@ class EncoderPretrainer:
             output = encoder(dummy_input)
         return output.shape[-1]
     
-    def _placeholder_loss(
-        self,
-        encoder: nn.Module,
-        trajectory_batch: TrajectoryMiniBatch,
-        source_ids: np.ndarray,
-    ) -> torch.Tensor:
-        """
-        Placeholder loss function. Replace with your custom loss.
-        
-        This example computes a simple reconstruction-style loss, but you should
-        define your own loss based on your pre-training objective.
-        
-        Args:
-            encoder: The encoder module to train.
-            trajectory_batch: Batch of trajectories containing:
-                - observations: (batch_size, trajectory_length, *obs_shape)
-                - actions: (batch_size, trajectory_length)
-                - rewards: (batch_size, trajectory_length)
-                - returns_to_go: (batch_size, trajectory_length)
-                - terminals: (batch_size, trajectory_length)
-                - timesteps: (batch_size, trajectory_length)
-            source_ids: Array indicating which dataset each trajectory came from.
-        
-        Returns:
-            Loss tensor.
-        """
-        # Example: encode observations and compute a dummy contrastive loss
-        # TODO: Replace with your actual pre-training loss
-        
-        observations = trajectory_batch.observations  # (batch, seq, *obs_shape)
-        batch_size, seq_len = observations.shape[:2]
-        obs_shape = observations.shape[2:]
-        
-        # Flatten batch and sequence dimensions for encoding
-        flat_obs = observations.reshape(-1, *obs_shape)  # (batch * seq, *obs_shape)
-        
-        # Move to device and normalize if using pixel observations
-        flat_obs = flat_obs.to(self.device).float()
-        
-        # Encode observations
-        features = encoder(flat_obs)  # (batch * seq, feature_size)
-        
-        # Reshape back to (batch, seq, feature_size)
-        features = features.reshape(batch_size, seq_len, -1)
-        
-        # Placeholder: use temporal consistency loss
-        # Minimize distance between adjacent time steps
-        if seq_len > 1:
-            loss = torch.mean((features[:, 1:] - features[:, :-1]) ** 2)
-        else:
-            loss = torch.tensor(0.0, device=self.device)
-        
-        return loss
     
     def _prepare_trajectory_batch(
         self, batch_with_source: TrajectoryBatchWithSource
@@ -211,20 +322,47 @@ class EncoderPretrainer:
         
         # Compute loss for each encoder
         total_loss = 0.0
+        all_metrics = {}
+        
         for encoder in self.encoders:
             encoder.train()
-            loss = self.loss_fn(encoder, trajectory_batch, source_ids)
-            total_loss = total_loss + loss
+        self.classifier.train()
         
-        # Average over encoders
-        avg_loss = total_loss / len(self.encoders)
+        # Use the first encoder for the loss (they share the same architecture)
+        # You could also average across encoders if needed
+        loss, metrics = self.loss_fn(
+            encoder=self.encoders[0],
+            classifier=self.classifier,
+            trajectory_batch=trajectory_batch,
+            source_ids=source_ids,
+            device=self.device,
+        )
+        
+        # If using multiple encoders, compute loss for each and average
+        if len(self.encoders) > 1:
+            for encoder in self.encoders[1:]:
+                additional_loss, _ = self.loss_fn(
+                    encoder=encoder,
+                    classifier=self.classifier,
+                    trajectory_batch=trajectory_batch,
+                    source_ids=source_ids,
+                    device=self.device,
+                )
+                loss = loss + additional_loss
+            loss = loss / len(self.encoders)
         
         # Backward pass
-        self.optimizer.zero_grad()
-        avg_loss.backward()
-        self.optimizer.step()
+        self.encoder_optimizer.zero_grad()
+        self.classifier_optimizer.zero_grad()
+        loss.backward()
+        self.encoder_optimizer.step()
+        self.classifier_optimizer.step()
         
-        return {"loss": avg_loss.item()}
+        # Collect metrics
+        all_metrics["loss"] = loss.item()
+        all_metrics.update(metrics)
+        
+        return all_metrics
     
     def pretrain(self) -> None:
         """Run the full pre-training loop."""
@@ -258,20 +396,46 @@ class EncoderPretrainer:
         print("Pre-training complete!")
         self.writer.close()
     
-    def save_encoder_weights(self, path: str) -> None:
-        """Save encoder weights to a file."""
+    def save_encoder_weights(self, path: str, include_classifier: bool = True) -> None:
+        """
+        Save encoder and classifier weights to a file.
+        
+        Args:
+            path: Path to save the weights.
+            include_classifier: Whether to include classifier weights.
+        """
         state_dict = {}
         for i, encoder in enumerate(self.encoders):
             state_dict[f"encoder_{i}"] = encoder.state_dict()
+        
+        if include_classifier:
+            state_dict["classifier"] = self.classifier.state_dict()
+            state_dict["classifier_config"] = {
+                "embedding_size": self.classifier.embedding_size,
+                "num_sources": self.classifier.num_sources,
+                "combine_mode": self.classifier.combine_mode,
+            }
+        
         torch.save(state_dict, path)
         print(f"Saved encoder weights to {path}")
     
-    def load_encoder_weights(self, path: str) -> None:
-        """Load encoder weights from a file."""
+    def load_encoder_weights(self, path: str, load_classifier: bool = True) -> None:
+        """
+        Load encoder and classifier weights from a file.
+        
+        Args:
+            path: Path to load the weights from.
+            load_classifier: Whether to load classifier weights.
+        """
         state_dict = torch.load(path, map_location=self.device)
         for i, encoder in enumerate(self.encoders):
             encoder.load_state_dict(state_dict[f"encoder_{i}"])
-        print(f"Loaded encoder weights from {path}")
+        
+        if load_classifier and "classifier" in state_dict:
+            self.classifier.load_state_dict(state_dict["classifier"])
+            print(f"Loaded encoder and classifier weights from {path}")
+        else:
+            print(f"Loaded encoder weights from {path}")
 
 
 def load_pretrained_encoder_to_cql(
@@ -320,90 +484,252 @@ def load_pretrained_encoder_to_cql(
 
 
 # =============================================================================
-# Example custom loss functions
+# Loss Functions
 # =============================================================================
 
-def contrastive_temporal_loss(
+def cardpol_loss(
     encoder: nn.Module,
+    classifier: CARDPOLClassifier,
     trajectory_batch: TrajectoryMiniBatch,
     source_ids: np.ndarray,
     device: str = "cuda:0",
-    temperature: float = 0.1,
-) -> torch.Tensor:
+) -> tuple:
     """
-    Example: Temporal contrastive loss.
+    CARDPOL (Contrastive Actor Recognition for Diverse POLicies) loss.
     
-    Encourages representations of adjacent timesteps to be similar,
-    and representations from different trajectories to be different.
+    For each trajectory:
+    1. Take the observation at t=0
+    2. Sample another observation from t in [1, trajectory_length)
+    3. Encode both observations
+    4. Use the classifier to predict which source policy they came from
+    
+    This loss encourages the encoder to learn representations that capture
+    policy-specific temporal dynamics, enabling recognition of different
+    behavior patterns across datasets.
+    
+    Args:
+        encoder: The encoder network to train.
+        classifier: The CARDPOLClassifier network.
+        trajectory_batch: Batch of trajectories.
+        source_ids: Array of source dataset/policy IDs for each trajectory.
+        device: Device to run computations on.
+    
+    Returns:
+        Tuple of (loss, metrics_dict)
     """
-    observations = trajectory_batch.observations
+    observations = trajectory_batch.observations  # (batch, seq, *obs_shape)
     batch_size, seq_len = observations.shape[:2]
     obs_shape = observations.shape[2:]
-    
-    # Flatten and encode
-    flat_obs = observations.reshape(-1, *obs_shape).to(device).float()
-    features = encoder(flat_obs)  # (batch * seq, feature_dim)
-    features = features.reshape(batch_size, seq_len, -1)
-    
-    # Normalize features
-    features = nn.functional.normalize(features, dim=-1)
     
     if seq_len < 2:
-        return torch.tensor(0.0, device=device)
+        # Need at least 2 timesteps
+        return torch.tensor(0.0, device=device, requires_grad=True), {"accuracy": 0.0}
     
-    # Positive pairs: adjacent timesteps
-    anchors = features[:, :-1].reshape(-1, features.shape[-1])
-    positives = features[:, 1:].reshape(-1, features.shape[-1])
+    # Get observation at t=0 for all trajectories
+    obs_t0 = observations[:, 0]  # (batch, *obs_shape)
     
-    # Similarity matrix
-    pos_sim = torch.sum(anchors * positives, dim=-1) / temperature
+    # Sample a random timestep from [1, seq_len) for each trajectory
+    random_t = torch.randint(1, seq_len, (batch_size,))
     
-    # Negative samples: other trajectories at same timestep
-    # For simplicity, use all other features as negatives
-    all_features = features.reshape(-1, features.shape[-1])
-    neg_sim = torch.mm(anchors, all_features.t()) / temperature
+    # Get observation at random_t for each trajectory
+    # We need to index each batch element with its corresponding random timestep
+    obs_t_random = observations[torch.arange(batch_size), random_t]  # (batch, *obs_shape)
     
-    # InfoNCE loss
-    logits = torch.cat([pos_sim.unsqueeze(-1), neg_sim], dim=-1)
-    labels = torch.zeros(logits.shape[0], dtype=torch.long, device=device)
+    # Move to device and convert to float
+    obs_t0 = obs_t0.to(device).float()
+    obs_t_random = obs_t_random.to(device).float()
+    
+    # Encode both observations
+    embedding_t0 = encoder(obs_t0)  # (batch, feature_dim)
+    embedding_t_random = encoder(obs_t_random)  # (batch, feature_dim)
+    
+    # Get source prediction from classifier
+    logits = classifier(embedding_t0, embedding_t_random)  # (batch, num_sources)
+    
+    # Compute cross-entropy loss
+    labels = torch.tensor(source_ids, dtype=torch.long, device=device)
     loss = nn.functional.cross_entropy(logits, labels)
     
-    return loss
+    # Compute accuracy for logging
+    with torch.no_grad():
+        predictions = torch.argmax(logits, dim=-1)
+        accuracy = (predictions == labels).float().mean().item()
+    
+    metrics = {
+        "accuracy": accuracy,
+        "avg_timestep": random_t.float().mean().item(),
+    }
+    
+    return loss, metrics
 
 
-def source_prediction_loss(
+def cardpol_loss_with_temporal_regularization(
     encoder: nn.Module,
+    classifier: CARDPOLClassifier,
     trajectory_batch: TrajectoryMiniBatch,
     source_ids: np.ndarray,
     device: str = "cuda:0",
-    num_sources: int = 2,
-) -> torch.Tensor:
+    temporal_weight: float = 0.1,
+) -> tuple:
     """
-    Example: Source dataset prediction loss.
+    CARDPOL loss with temporal regularization.
     
-    Trains the encoder to predict which dataset a trajectory came from.
-    This can help learn representations that capture policy-specific features.
+    Same as cardpol_loss, but also encourages embeddings at different 
+    timesteps within the same trajectory to be similar (temporal consistency).
+    
+    Args:
+        encoder: The encoder network to train.
+        classifier: The CARDPOLClassifier network.
+        trajectory_batch: Batch of trajectories.
+        source_ids: Array of source dataset IDs for each trajectory.
+        device: Device to run computations on.
+        temporal_weight: Weight for the temporal consistency loss.
+    
+    Returns:
+        Tuple of (loss, metrics_dict)
     """
     observations = trajectory_batch.observations
     batch_size, seq_len = observations.shape[:2]
     obs_shape = observations.shape[2:]
     
-    # Encode first observation of each trajectory
-    first_obs = observations[:, 0].to(device).float()
-    features = encoder(first_obs)  # (batch, feature_dim)
+    if seq_len < 2:
+        return torch.tensor(0.0, device=device, requires_grad=True), {"accuracy": 0.0}
     
-    # Simple linear classifier for source prediction
-    # In practice, you'd want to maintain this as a separate module
-    if not hasattr(encoder, '_source_classifier'):
-        encoder._source_classifier = nn.Linear(
-            features.shape[-1], num_sources
-        ).to(device)
+    # Get observation at t=0
+    obs_t0 = observations[:, 0].to(device).float()
     
-    logits = encoder._source_classifier(features)
+    # Sample random timestep from [1, seq_len)
+    random_t = torch.randint(1, seq_len, (batch_size,))
+    obs_t_random = observations[torch.arange(batch_size), random_t].to(device).float()
+    
+    # Encode both observations
+    embedding_t0 = encoder(obs_t0)
+    embedding_t_random = encoder(obs_t_random)
+    
+    # Source prediction loss
+    logits = classifier(embedding_t0, embedding_t_random)
     labels = torch.tensor(source_ids, dtype=torch.long, device=device)
+    classification_loss = nn.functional.cross_entropy(logits, labels)
     
-    loss = nn.functional.cross_entropy(logits, labels)
-    return loss
+    # Temporal consistency loss (embeddings should be similar within a trajectory)
+    temporal_loss = torch.mean((embedding_t0 - embedding_t_random) ** 2)
+    
+    # Combined loss
+    loss = classification_loss + temporal_weight * temporal_loss
+    
+    # Compute metrics
+    with torch.no_grad():
+        predictions = torch.argmax(logits, dim=-1)
+        accuracy = (predictions == labels).float().mean().item()
+    
+    metrics = {
+        "accuracy": accuracy,
+        "classification_loss": classification_loss.item(),
+        "temporal_loss": temporal_loss.item(),
+        "avg_timestep": random_t.float().mean().item(),
+    }
+    
+    return loss, metrics
+
+
+def cardpol_contrastive_loss(
+    encoder: nn.Module,
+    classifier: CARDPOLClassifier,
+    trajectory_batch: TrajectoryMiniBatch,
+    source_ids: np.ndarray,
+    device: str = "cuda:0",
+    contrastive_weight: float = 0.5,
+    temperature: float = 0.1,
+) -> tuple:
+    """
+    CARDPOL loss with contrastive regularization.
+    
+    Combines CARDPOL source prediction with a contrastive objective that
+    pulls together embeddings from the same source policy and pushes apart
+    embeddings from different source policies.
+    
+    Args:
+        encoder: The encoder network to train.
+        classifier: The CARDPOLClassifier network.
+        trajectory_batch: Batch of trajectories.
+        source_ids: Array of source dataset IDs for each trajectory.
+        device: Device to run computations on.
+        contrastive_weight: Weight for the contrastive loss term.
+        temperature: Temperature for contrastive loss.
+    
+    Returns:
+        Tuple of (loss, metrics_dict)
+    """
+    observations = trajectory_batch.observations
+    batch_size, seq_len = observations.shape[:2]
+    
+    if seq_len < 2:
+        return torch.tensor(0.0, device=device, requires_grad=True), {"accuracy": 0.0}
+    
+    # Get observations at t=0 and random t
+    obs_t0 = observations[:, 0].to(device).float()
+    random_t = torch.randint(1, seq_len, (batch_size,))
+    obs_t_random = observations[torch.arange(batch_size), random_t].to(device).float()
+    
+    # Encode observations
+    embedding_t0 = encoder(obs_t0)
+    embedding_t_random = encoder(obs_t_random)
+    
+    # Source prediction loss
+    logits = classifier(embedding_t0, embedding_t_random)
+    labels = torch.tensor(source_ids, dtype=torch.long, device=device)
+    classification_loss = nn.functional.cross_entropy(logits, labels)
+    
+    # Contrastive loss: pull together same-source, push apart different-source
+    # Concatenate embeddings for contrastive computation
+    all_embeddings = torch.cat([embedding_t0, embedding_t_random], dim=0)  # (2*batch, feature_dim)
+    all_embeddings = nn.functional.normalize(all_embeddings, dim=-1)
+    all_labels = torch.cat([labels, labels], dim=0)  # (2*batch,)
+    
+    # Compute similarity matrix
+    similarity = torch.mm(all_embeddings, all_embeddings.t()) / temperature  # (2*batch, 2*batch)
+    
+    # Create mask for positive pairs (same source)
+    label_matrix = all_labels.unsqueeze(0) == all_labels.unsqueeze(1)  # (2*batch, 2*batch)
+    
+    # Remove diagonal (self-similarity)
+    mask = ~torch.eye(similarity.shape[0], dtype=torch.bool, device=device)
+    
+    # Supervised contrastive loss
+    positive_mask = label_matrix & mask
+    negative_mask = ~label_matrix & mask
+    
+    if positive_mask.any():
+        # For each anchor, compute loss over its positive and negative pairs
+        exp_sim = torch.exp(similarity) * mask.float()
+        
+        # Sum of exp similarities with negatives + positives
+        denominator = exp_sim.sum(dim=1, keepdim=True)
+        
+        # Log probability of positive pairs
+        log_prob = similarity - torch.log(denominator + 1e-8)
+        
+        # Average over positive pairs
+        contrastive_loss = -(log_prob * positive_mask.float()).sum() / positive_mask.float().sum()
+    else:
+        contrastive_loss = torch.tensor(0.0, device=device)
+    
+    # Combined loss
+    loss = classification_loss + contrastive_weight * contrastive_loss
+    
+    # Compute metrics
+    with torch.no_grad():
+        predictions = torch.argmax(logits, dim=-1)
+        accuracy = (predictions == labels).float().mean().item()
+    
+    metrics = {
+        "accuracy": accuracy,
+        "classification_loss": classification_loss.item(),
+        "contrastive_loss": contrastive_loss.item() if isinstance(contrastive_loss, torch.Tensor) else contrastive_loss,
+        "avg_timestep": random_t.float().mean().item(),
+    }
+    
+    return loss, metrics
 
 
 # =============================================================================
@@ -477,47 +803,45 @@ if __name__ == "__main__":
     cql.build_with_dataset(datasets[0])
     print("CQL model built.")
     
-    # Create pre-trainer
+    # Create pre-trainer config
     config = EncoderPretrainConfig(
         learning_rate=1e-4,
+        classifier_learning_rate=1e-4,
         batch_size=32,
         trajectory_length=10,
         n_steps=10000,  # Reduced for demonstration
+        num_sources=len(datasets),
+        classifier_hidden_sizes=[256, 128],
+        classifier_combine_mode="concat",  # Options: 'concat', 'diff', 'concat_diff'
         log_interval=100,
         save_interval=2000,
         log_dir=log_dir,
         device=device,
     )
     
-    # Define your custom loss function here
-    # For now, using the placeholder (temporal consistency)
-    def my_custom_loss(encoder, trajectory_batch, source_ids):
-        """
-        TODO: Define your custom loss function here.
-        
-        This function receives:
-        - encoder: The neural network encoder to train
-        - trajectory_batch: TrajectoryMiniBatch with observations, actions, rewards, etc.
-        - source_ids: Array indicating which dataset each trajectory came from
-        
-        Return a scalar loss tensor.
-        """
-        # Example: use contrastive temporal loss
-        return contrastive_temporal_loss(
-            encoder, trajectory_batch, source_ids, 
-            device=config.device, temperature=0.1
-        )
-    
+    # Create pre-trainer with the pairwise source prediction loss
+    # The default loss is cardpol_loss which:
+    # 1. Takes observation at t=0
+    # 2. Samples another observation from t in [1, trajectory_length)
+    # 3. Encodes both and uses the classifier to predict source_id
     pretrainer = EncoderPretrainer(
         cql=cql,
         combined_dataset=combined,
         config=config,
-        loss_fn=my_custom_loss,
+        loss_fn=cardpol_loss,  # Default loss
+        # Alternative losses:
+        # loss_fn=cardpol_loss_with_temporal_regularization,
+        # loss_fn=cardpol_contrastive_loss,
     )
     
     print(f"\nEncoder architecture:")
     print(pretrainer.get_encoder(0))
     print(f"\nEncoder feature size: {pretrainer.get_encoder_feature_size()}")
+    
+    print(f"\nClassifier architecture:")
+    print(pretrainer.classifier)
+    print(f"Number of sources: {config.num_sources}")
+    print(f"Combine mode: {config.classifier_combine_mode}")
     
     # Run pre-training
     print("\n" + "=" * 50)
@@ -548,7 +872,7 @@ if __name__ == "__main__":
     # Build with the target dataset
     policy_cql.build_with_dataset(target_dataset)
     
-    # Load pre-trained encoder weights
+    # Load pre-trained encoder weights (classifier weights are saved but not loaded into CQL)
     load_pretrained_encoder_to_cql(policy_cql, "encoder_final.pt")
     
     # Optional: Freeze encoder weights during policy training
@@ -558,4 +882,16 @@ if __name__ == "__main__":
     
     # Train policy
     policy_cql.fit(target_dataset, n_steps=100000)
+    
+    # Note: The classifier is saved alongside encoder weights.
+    # You can load it separately if needed for analysis:
+    # 
+    # checkpoint = torch.load("encoder_final.pt")
+    # classifier_config = checkpoint["classifier_config"]
+    # classifier = CARDPOLClassifier(
+    #     embedding_size=classifier_config["embedding_size"],
+    #     num_sources=classifier_config["num_sources"],
+    #     combine_mode=classifier_config["combine_mode"],
+    # )
+    # classifier.load_state_dict(checkpoint["classifier"])
     """)
