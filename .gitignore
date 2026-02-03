@@ -22,3 +22,5 @@ dist
 /.idea/
 *.egg-info
 /.vscode/
+**/*.mp4
+**/*.png

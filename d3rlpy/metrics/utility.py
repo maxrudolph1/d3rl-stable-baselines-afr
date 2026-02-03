@@ -14,7 +14,8 @@ def evaluate_qlearning_with_environment(
     env: GymEnv,
     n_trials: int = 10,
     epsilon: float = 0.0,
-) -> float:
+    return_frames: bool = False,
+) -> float | tuple[float, list[np.ndarray]]:
     """Returns average environment score.
 
     .. code-block:: python
@@ -41,6 +42,7 @@ def evaluate_qlearning_with_environment(
         average score.
     """
     episode_rewards = []
+    frames = []
     for _ in range(n_trials):
         observation, _ = env.reset()
         episode_reward = 0.0
@@ -63,12 +65,17 @@ def evaluate_qlearning_with_environment(
                 action = algo.predict(observation)[0]
 
             observation, reward, done, truncated, _ = env.step(action)
+            frames.append(observation)
             episode_reward += float(reward)
 
             if done or truncated:
                 break
         episode_rewards.append(episode_reward)
-    return float(np.mean(episode_rewards))
+        
+    if return_frames:
+        return float(np.mean(episode_rewards)), frames
+    else:
+        return float(np.mean(episode_rewards))
 
 
 def evaluate_transformer_with_environment(

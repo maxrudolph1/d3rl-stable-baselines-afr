@@ -526,23 +526,27 @@ class EnvironmentEvaluator(EvaluatorProtocol):
     _env: GymEnv
     _n_trials: int
     _epsilon: float
-
+    _return_frames: bool
+    
     def __init__(
         self,
         env: GymEnv,
         n_trials: int = 10,
         epsilon: float = 0.0,
+        return_frames: bool = False,
     ):
         self._env = env
         self._n_trials = n_trials
         self._epsilon = epsilon
+        self._return_frames = return_frames
 
     def __call__(
         self, algo: QLearningAlgoProtocol, dataset: ReplayBufferBase
-    ) -> float:
+    ) -> float | tuple[float, list[np.ndarray]]:
         return evaluate_qlearning_with_environment(
             algo=algo,
             env=self._env,
             n_trials=self._n_trials,
             epsilon=self._epsilon,
+            return_frames=self._return_frames,
         )
