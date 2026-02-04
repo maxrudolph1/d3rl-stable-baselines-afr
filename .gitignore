@@ -28,3 +28,4 @@ wandb/
 atari_data
 encoder_pretrain_atari
 encoder_pretrain_qbert
+encoder_pretrain_logs

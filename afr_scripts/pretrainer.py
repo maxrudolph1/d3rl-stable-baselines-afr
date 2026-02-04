@@ -1,0 +1,552 @@
+"""
+Encoder pre-training for CARDPOL.
+
+Provides EncoderPretrainConfig, EncoderPretrainer, and utilities for
+loading pre-trained encoder weights into CQL models.
+"""
+
+import os
+from dataclasses import dataclass
+from typing import Callable, Dict, Optional
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
+import d3rlpy
+
+from afr_scripts.classifier import CARDPOLClassifier
+from afr_scripts.extended_dataset import CombinedMDPDataset, TrajectoryBatchWithSource
+from afr_scripts.losses import cardpol_loss, normalize_pixel_obs
+
+
+@dataclass
+class EncoderPretrainConfig:
+    """Configuration for encoder pre-training."""
+
+    # Training
+    learning_rate: float = 1e-3
+    classifier_learning_rate: float = 1e-3
+    batch_size: int = 32
+    trajectory_length: int = 10
+    n_steps: int = 100000
+
+    # Classifier configuration
+    num_sources: int = 2
+    classifier_hidden_sizes: list = None  # Default: [256, 128]
+    classifier_combine_mode: str = "concat"  # 'concat', 'diff', or 'concat_diff'
+
+    # Logging
+    log_interval: int = 100
+    save_interval: int = 10000
+    log_dir: str = "encoder_pretrain_logs"
+
+    # Wandb logging
+    use_wandb: bool = False
+    wandb_project: str = "encoder_pretrain"
+    wandb_entity: str = None  # None uses default entity
+    wandb_run_name: str = None  # None auto-generates name
+    wandb_tags: list = None  # Optional tags for the run
+
+    # Validation
+    val_interval: int = 500  # How often to run validation (0 to disable)
+    val_batch_size: int = 64  # Batch size for validation
+    val_n_batches: int = 10  # Number of batches to use for validation
+
+    # Device
+    device: str = "cuda:0"
+
+    def __post_init__(self):
+        if self.classifier_hidden_sizes is None:
+            self.classifier_hidden_sizes = [256, 128]
+        if self.wandb_tags is None:
+            self.wandb_tags = []
+
+
+class EncoderPretrainer:
+    """
+    Pre-trains CQL encoders using a custom loss function on trajectories
+    from a combined MDP dataset.
+
+    The encoder is extracted from the CQL's Q-function network.
+    For DiscreteCQL, the Q-function has an encoder that processes observations
+    before the final Q-value head.
+
+    Example:
+        >>> pretrainer = EncoderPretrainer(
+        ...     cql=cql,
+        ...     combined_dataset=combined,
+        ...     config=config,
+        ...     loss_fn=my_custom_loss_fn,
+        ... )
+        >>> pretrainer.pretrain()
+        >>> pretrainer.save_encoder_weights("encoder_weights.pt")
+    """
+
+    def __init__(
+        self,
+        cql: d3rlpy.algos.DiscreteCQL,
+        combined_dataset: CombinedMDPDataset,
+        config: EncoderPretrainConfig,
+        loss_fn: Optional[Callable] = None,
+        classifier: Optional[CARDPOLClassifier] = None,
+        val_combined_dataset: Optional[CombinedMDPDataset] = None,
+    ):
+        """
+        Args:
+            cql: A built DiscreteCQL model.
+            combined_dataset: Combined MDP dataset for sampling trajectories.
+            config: Pre-training configuration.
+            loss_fn: Custom loss function. Should accept
+                     (encoder, classifier, trajectory_batch, source_ids, device)
+                     and return a loss tensor. If None, uses cardpol_loss.
+            classifier: Optional pre-initialized CARDPOLClassifier.
+                       If None, one will be created based on config.
+            val_combined_dataset: Optional validation CombinedMDPDataset for
+                                  evaluating classifier accuracy during training.
+        """
+        self.cql = cql
+        self.combined_dataset = combined_dataset
+        self.val_combined_dataset = val_combined_dataset
+        self.config = config
+        self.device = config.device
+
+        # Extract encoders from Q-functions
+        self.encoders = self._extract_encoders()
+
+        # Get encoder feature size
+        encoder_feature_size = self._compute_encoder_feature_size()
+
+        # Create or use provided classifier
+        if classifier is not None:
+            self.classifier = classifier.to(self.device)
+        else:
+            self.classifier = CARDPOLClassifier(
+                embedding_size=encoder_feature_size,
+                num_sources=config.num_sources,
+                hidden_sizes=config.classifier_hidden_sizes,
+                combine_mode=config.classifier_combine_mode,
+            ).to(self.device)
+
+        # Set up optimizer for encoder parameters
+        encoder_params = []
+        for encoder in self.encoders:
+            encoder_params.extend(encoder.parameters())
+        self.encoder_optimizer = optim.Adam(encoder_params, lr=config.learning_rate)
+
+        # Set up optimizer for classifier parameters
+        self.classifier_optimizer = optim.Adam(
+            self.classifier.parameters(),
+            lr=config.classifier_learning_rate
+        )
+
+        # Loss function (user-defined or default pairwise source prediction)
+        self.loss_fn = loss_fn or cardpol_loss
+
+        # Logging
+        self.writer = SummaryWriter(config.log_dir)
+
+        # Initialize wandb if enabled
+        self.use_wandb = config.use_wandb and WANDB_AVAILABLE
+        if config.use_wandb and not WANDB_AVAILABLE:
+            print("Warning: wandb requested but not installed. Skipping wandb logging.")
+        if self.use_wandb:
+            wandb.init(
+                project=config.wandb_project,
+                entity=config.wandb_entity,
+                name=config.wandb_run_name,
+                tags=config.wandb_tags,
+                config={
+                    "learning_rate": config.learning_rate,
+                    "classifier_learning_rate": config.classifier_learning_rate,
+                    "batch_size": config.batch_size,
+                    "trajectory_length": config.trajectory_length,
+                    "n_steps": config.n_steps,
+                    "num_sources": config.num_sources,
+                    "classifier_hidden_sizes": config.classifier_hidden_sizes,
+                    "classifier_combine_mode": config.classifier_combine_mode,
+                    "val_interval": config.val_interval,
+                    "val_batch_size": config.val_batch_size,
+                    "val_n_batches": config.val_n_batches,
+                    "encoder_feature_size": encoder_feature_size,
+                    "num_encoders": len(self.encoders),
+                    "device": config.device,
+                },
+            )
+            # Watch encoder and classifier models for gradient tracking
+            wandb.watch(self.encoders[0], log="gradients", log_freq=config.log_interval)
+            wandb.watch(self.classifier, log="gradients", log_freq=config.log_interval)
+
+    def _compute_encoder_feature_size(self) -> int:
+        """Compute the output feature size of the encoder."""
+        encoder = self.encoders[0]
+        with torch.no_grad():
+            obs_shape = self.cql._impl.observation_shape
+            dummy_input = torch.zeros(1, *obs_shape, device=self.device)
+            output = encoder(dummy_input)
+        return output.shape[-1]
+
+    def _extract_encoders(self) -> list:
+        """Extract encoder modules from CQL's Q-functions."""
+        if self.cql._impl is None:
+            raise RuntimeError("CQL must be built before extracting encoders. "
+                               "Call cql.build_with_dataset(dataset) first.")
+
+        q_funcs = self.cql._impl._modules.q_funcs
+        encoders = []
+        for q_func in q_funcs:
+            encoders.append(q_func.encoder)
+        return encoders
+
+    def get_encoder(self, index: int = 0) -> nn.Module:
+        """Get a specific encoder by index."""
+        return self.encoders[index]
+
+    def get_encoder_feature_size(self) -> int:
+        """Get the output feature size of the encoder."""
+        encoder = self.encoders[0]
+        with torch.no_grad():
+            obs_shape = self.cql._impl.observation_shape
+            dummy_input = torch.zeros(1, *obs_shape, device=self.device)
+            output = encoder(dummy_input)
+        return output.shape[-1]
+
+    def _prepare_trajectory_batch(
+        self, batch_with_source: TrajectoryBatchWithSource
+    ) -> tuple:
+        """Prepare trajectory batch for training."""
+        trajectory_batch = batch_with_source.batch
+        source_ids = batch_with_source.source_ids
+        return trajectory_batch, source_ids
+
+    def pretrain_step(self) -> Dict[str, float]:
+        """Execute a single pre-training step."""
+        # Sample trajectory batch from combined dataset
+        batch_with_source = self.combined_dataset.sample_trajectory_batch(
+            batch_size=self.config.batch_size,
+            length=self.config.trajectory_length,
+        )
+        trajectory_batch, source_ids = self._prepare_trajectory_batch(batch_with_source)
+
+        # Compute loss for each encoder
+        all_metrics = {}
+
+        for encoder in self.encoders:
+            encoder.train()
+        self.classifier.train()
+
+        # Use the first encoder for the loss (they share the same architecture)
+        loss, metrics = self.loss_fn(
+            encoder=self.encoders[0],
+            classifier=self.classifier,
+            trajectory_batch=trajectory_batch,
+            source_ids=source_ids,
+            device=self.device,
+        )
+
+        # If using multiple encoders, compute loss for each and average
+        if len(self.encoders) > 1:
+            for encoder in self.encoders[1:]:
+                additional_loss, _ = self.loss_fn(
+                    encoder=encoder,
+                    classifier=self.classifier,
+                    trajectory_batch=trajectory_batch,
+                    source_ids=source_ids,
+                    device=self.device,
+                )
+                loss = loss + additional_loss
+            loss = loss / len(self.encoders)
+
+        # Backward pass
+        self.encoder_optimizer.zero_grad()
+        self.classifier_optimizer.zero_grad()
+        loss.backward()
+        self.encoder_optimizer.step()
+        self.classifier_optimizer.step()
+
+        # Collect metrics
+        all_metrics["loss"] = loss.item()
+        all_metrics.update(metrics)
+
+        return all_metrics
+
+    @torch.no_grad()
+    def validate(self) -> Dict[str, float]:
+        """
+        Run validation on the validation dataset.
+
+        Returns:
+            Dictionary of validation metrics including accuracy and loss.
+        """
+        if self.val_combined_dataset is None:
+            return {}
+
+        # Set models to eval mode
+        for encoder in self.encoders:
+            encoder.eval()
+        self.classifier.eval()
+
+        total_loss = 0.0
+        total_correct = 0
+        total_samples = 0
+        all_predictions = []
+        all_labels = []
+
+        for _ in range(self.config.val_n_batches):
+            # Sample validation batch
+            batch_with_source = self.val_combined_dataset.sample_trajectory_batch(
+                batch_size=self.config.val_batch_size,
+                length=self.config.trajectory_length,
+            )
+            trajectory_batch, source_ids = self._prepare_trajectory_batch(batch_with_source)
+
+            # Get observations
+            observations = trajectory_batch.observations
+            batch_size, seq_len = observations.shape[:2]
+
+            if seq_len < 2:
+                continue
+
+            # Convert to tensor if numpy array
+            if isinstance(observations, np.ndarray):
+                observations = torch.from_numpy(observations)
+
+            # Get observation at t=0 for all trajectories and normalize
+            obs_t0 = normalize_pixel_obs(observations[:, 0].to(self.device))
+
+            # Sample random timesteps
+            random_t = torch.randint(1, seq_len, (batch_size,))
+            obs_t_random = normalize_pixel_obs(
+                observations[torch.arange(batch_size), random_t].to(self.device)
+            )
+
+            # Encode observations
+            embedding_t0 = self.encoders[0](obs_t0)
+            embedding_t_random = self.encoders[0](obs_t_random)
+
+            # Get predictions
+            logits = self.classifier(embedding_t0, embedding_t_random)
+            labels = torch.tensor(source_ids, dtype=torch.long, device=self.device)
+
+            # Compute loss
+            loss = nn.functional.cross_entropy(logits, labels)
+            total_loss += loss.item() * batch_size
+
+            # Compute accuracy
+            predictions = torch.argmax(logits, dim=-1)
+            total_correct += (predictions == labels).sum().item()
+            total_samples += batch_size
+
+            # Store for per-class metrics
+            all_predictions.extend(predictions.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+        # Set models back to train mode
+        for encoder in self.encoders:
+            encoder.train()
+        self.classifier.train()
+
+        if total_samples == 0:
+            return {"val_accuracy": 0.0, "val_loss": 0.0}
+
+        val_metrics = {
+            "val_accuracy": total_correct / total_samples,
+            "val_loss": total_loss / total_samples,
+        }
+
+        # Compute per-class accuracy if we have enough data
+        all_predictions = np.array(all_predictions)
+        all_labels = np.array(all_labels)
+
+        for source_id in range(self.config.num_sources):
+            mask = all_labels == source_id
+            if mask.sum() > 0:
+                class_acc = (all_predictions[mask] == source_id).mean()
+                val_metrics[f"val_accuracy_source_{source_id}"] = class_acc
+
+        return val_metrics
+
+    def pretrain(self) -> None:
+        """Run the full pre-training loop."""
+        print(f"Starting encoder pre-training for {self.config.n_steps} steps...")
+        print(f"Batch size: {self.config.batch_size}, Trajectory length: {self.config.trajectory_length}")
+        print(f"Number of encoders: {len(self.encoders)}")
+        print(f"Encoder feature size: {self.get_encoder_feature_size()}")
+        print(f"Logging to: {self.config.log_dir}")
+        if self.use_wandb:
+            print(f"Wandb logging enabled: {self.config.wandb_project}")
+        if self.val_combined_dataset is not None:
+            print(f"Validation enabled: every {self.config.val_interval} steps")
+        else:
+            print("Validation: disabled (no validation dataset provided)")
+        print("-" * 50)
+
+        best_val_accuracy = 0.0
+        for step in range(1, self.config.n_steps + 1):
+            metrics = self.pretrain_step()
+
+            # Log metrics to tensorboard
+            for name, value in metrics.items():
+                self.writer.add_scalar(f"pretrain/{name}", value, step)
+
+            # Log metrics to wandb
+            if self.use_wandb:
+                wandb.log({f"train/{k}": v for k, v in metrics.items()}, step=step)
+
+            # Run validation
+            if (self.config.val_interval > 0 and
+                self.val_combined_dataset is not None and
+                step % self.config.val_interval == 0):
+                val_metrics = self.validate()
+                for name, value in val_metrics.items():
+                    self.writer.add_scalar(f"pretrain/{name}", value, step)
+
+                # Log validation metrics to wandb
+                if self.use_wandb:
+                    wandb.log({f"val/{k}": v for k, v in val_metrics.items()}, step=step)
+
+                    # Track best validation accuracy
+                    if val_metrics.get("val_accuracy", 0) > best_val_accuracy:
+                        best_val_accuracy = val_metrics["val_accuracy"]
+                        wandb.run.summary["best_val_accuracy"] = best_val_accuracy
+                        wandb.run.summary["best_val_step"] = step
+
+                # Print validation metrics
+                val_str = ", ".join(f"{k}: {v:.4f}" for k, v in val_metrics.items())
+                print(f"Step {step}/{self.config.n_steps} - VALIDATION - {val_str}")
+
+            # Print progress
+            if step % self.config.log_interval == 0:
+                loss_str = ", ".join(f"{k}: {v:.4f}" for k, v in metrics.items())
+                print(f"Step {step}/{self.config.n_steps} - {loss_str}")
+
+            # Save checkpoint
+            if step % self.config.save_interval == 0:
+                checkpoint_path = os.path.join(
+                    self.config.log_dir, f"encoder_checkpoint_{step}.pt"
+                )
+                self.save_encoder_weights(checkpoint_path)
+                print(f"Saved checkpoint to {checkpoint_path}")
+
+                # Log checkpoint artifact to wandb
+                if self.use_wandb:
+                    artifact = wandb.Artifact(
+                        f"encoder_checkpoint_{step}",
+                        type="model",
+                        description=f"Encoder checkpoint at step {step}"
+                    )
+                    artifact.add_file(checkpoint_path)
+                    wandb.log_artifact(artifact)
+
+        # Run final validation
+        if self.val_combined_dataset is not None:
+            print("\nFinal validation:")
+            val_metrics = self.validate()
+            val_str = ", ".join(f"{k}: {v:.4f}" for k, v in val_metrics.items())
+            print(f"  {val_str}")
+
+            # Log final validation metrics to wandb summary
+            if self.use_wandb:
+                for k, v in val_metrics.items():
+                    wandb.run.summary[f"final_{k}"] = v
+
+        print("Pre-training complete!")
+        self.writer.close()
+
+        # Finish wandb run
+        if self.use_wandb:
+            wandb.finish()
+
+    def save_encoder_weights(self, path: str, include_classifier: bool = True) -> None:
+        """
+        Save encoder and classifier weights to a file.
+
+        Args:
+            path: Path to save the weights.
+            include_classifier: Whether to include classifier weights.
+        """
+        state_dict = {}
+        for i, encoder in enumerate(self.encoders):
+            state_dict[f"encoder_{i}"] = encoder.state_dict()
+
+        if include_classifier:
+            state_dict["classifier"] = self.classifier.state_dict()
+            state_dict["classifier_config"] = {
+                "embedding_size": self.classifier.embedding_size,
+                "num_sources": self.classifier.num_sources,
+                "combine_mode": self.classifier.combine_mode,
+            }
+
+        torch.save(state_dict, path)
+        print(f"Saved encoder weights to {path}")
+
+    def load_encoder_weights(self, path: str, load_classifier: bool = True) -> None:
+        """
+        Load encoder and classifier weights from a file.
+
+        Args:
+            path: Path to load the weights from.
+            load_classifier: Whether to load classifier weights.
+        """
+        state_dict = torch.load(path, map_location=self.device)
+        for i, encoder in enumerate(self.encoders):
+            encoder.load_state_dict(state_dict[f"encoder_{i}"])
+
+        if load_classifier and "classifier" in state_dict:
+            self.classifier.load_state_dict(state_dict["classifier"])
+            print(f"Loaded encoder and classifier weights from {path}")
+        else:
+            print(f"Loaded encoder weights from {path}")
+
+
+def load_pretrained_encoder_to_cql(
+    cql: d3rlpy.algos.DiscreteCQL,
+    encoder_weights_path: str,
+    device: str = "cuda:0",
+) -> None:
+    """
+    Load pre-trained encoder weights into a CQL model.
+
+    This function loads encoder weights saved during pre-training into
+    a newly created CQL model, allowing you to train the policy with
+    a pre-trained encoder.
+
+    Args:
+        cql: A built DiscreteCQL model.
+        encoder_weights_path: Path to saved encoder weights.
+        device: Device to load weights to.
+
+    Example:
+        >>> cql = d3rlpy.algos.DiscreteCQLConfig(...).create(device='cuda:0')
+        >>> cql.build_with_dataset(new_dataset)
+        >>> load_pretrained_encoder_to_cql(cql, "encoder_weights.pt")
+        >>> cql.fit(new_dataset, n_steps=100000)
+    """
+    if cql._impl is None:
+        raise RuntimeError("CQL must be built before loading encoder weights. "
+                           "Call cql.build_with_dataset(dataset) first.")
+
+    state_dict = torch.load(encoder_weights_path, map_location=device)
+    q_funcs = cql._impl._modules.q_funcs
+
+    for i, q_func in enumerate(q_funcs):
+        encoder_key = f"encoder_{i}"
+        if encoder_key in state_dict:
+            q_func.encoder.load_state_dict(state_dict[encoder_key])
+            print(f"Loaded weights for Q-function {i} encoder")
+
+    # Also load into target Q-functions for consistency
+    targ_q_funcs = cql._impl._modules.targ_q_funcs
+    for i, targ_q_func in enumerate(targ_q_funcs):
+        encoder_key = f"encoder_{i}"
+        if encoder_key in state_dict:
+            targ_q_func.encoder.load_state_dict(state_dict[encoder_key])
+            print(f"Loaded weights for target Q-function {i} encoder")

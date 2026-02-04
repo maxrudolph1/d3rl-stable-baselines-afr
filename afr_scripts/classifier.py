@@ -1,0 +1,117 @@
+"""
+CARDPOL Classifier for source policy prediction.
+
+The classifier takes two embeddings (from different timesteps of the same
+trajectory) and predicts which source policy generated the trajectory.
+"""
+
+import torch
+import torch.nn as nn
+
+
+class CARDPOLClassifier(nn.Module):
+    """
+    CARDPOL classifier network.
+
+    Takes two embeddings from the encoder and outputs logits representing
+    source_id (policy) probabilities.
+
+    The classifier can combine the embeddings in various ways:
+    - concatenation: [emb1, emb2]
+    - difference: emb1 - emb2
+    - concatenation + difference: [emb1, emb2, emb1 - emb2]
+
+    Args:
+        embedding_size: Size of each embedding from the encoder.
+        num_sources: Number of source datasets/policies to classify.
+        hidden_sizes: List of hidden layer sizes. Defaults to [256, 128].
+        combine_mode: How to combine the two embeddings.
+            Options: 'concat', 'diff', 'concat_diff'.
+    """
+
+    def __init__(
+        self,
+        embedding_size: int,
+        num_sources: int,
+        hidden_sizes: list = None,
+        combine_mode: str = "concat",
+    ):
+        super().__init__()
+
+        if hidden_sizes is None:
+            hidden_sizes = [256, 128]
+
+        self.combine_mode = combine_mode
+        self.embedding_size = embedding_size
+        self.num_sources = num_sources
+
+        # Compute input size based on combine mode
+        if combine_mode == "concat":
+            input_size = embedding_size * 2
+        elif combine_mode == "diff":
+            input_size = embedding_size
+        elif combine_mode == "concat_diff":
+            input_size = embedding_size * 3
+        else:
+            raise ValueError(f"Unknown combine_mode: {combine_mode}")
+
+        # Build MLP layers
+        layers = []
+        in_size = input_size
+        for hidden_size in hidden_sizes:
+            layers.append(nn.Linear(in_size, hidden_size))
+            layers.append(nn.ReLU())
+            in_size = hidden_size
+
+        # Output layer
+        layers.append(nn.Linear(in_size, num_sources))
+
+        self.network = nn.Sequential(*layers)
+
+    def forward(
+        self,
+        embedding1: torch.Tensor,
+        embedding2: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Forward pass through the classifier.
+
+        Args:
+            embedding1: First embedding, shape (batch_size, embedding_size).
+            embedding2: Second embedding, shape (batch_size, embedding_size).
+
+        Returns:
+            Logits of shape (batch_size, num_sources).
+        """
+        if self.combine_mode == "concat":
+            combined = torch.cat([embedding1, embedding2], dim=-1)
+        elif self.combine_mode == "diff":
+            combined = embedding1 - embedding2
+        elif self.combine_mode == "concat_diff":
+            combined = torch.cat([
+                embedding1,
+                embedding2,
+                embedding1 - embedding2
+            ], dim=-1)
+        else:
+            raise ValueError(f"Unknown combine_mode: {self.combine_mode}")
+
+        return self.network(combined)
+
+    def predict_proba(
+        self,
+        embedding1: torch.Tensor,
+        embedding2: torch.Tensor,
+    ) -> torch.Tensor:
+        """Get probability predictions."""
+        logits = self.forward(embedding1, embedding2)
+        return torch.softmax(logits, dim=-1)
+
+    def predict(
+        self,
+        embedding1: torch.Tensor,
+        embedding2: torch.Tensor,
+    ) -> torch.Tensor:
+        """Get class predictions."""
+        logits = self.forward(embedding1, embedding2)
+        return torch.argmax(logits, dim=-1)
