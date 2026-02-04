@@ -33,6 +33,12 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 import d3rlpy
 from d3rlpy.dataset import MDPDataset, TrajectoryMiniBatch
 from d3rlpy.preprocessing import PixelObservationScaler, ClipRewardScaler
@@ -51,7 +57,7 @@ from afr_scripts.extended_dataset import CombinedMDPDataset, TrajectoryBatchWith
 
 class CARDPOLClassifier(nn.Module):
     """
-    CARDPOL (Contrastive Actor Recognition for Diverse POLicies) classifier.
+    CARDPol classifier.
     
     A classifier network that takes two embeddings from the encoder and
     outputs logits representing source_id (policy) probabilities.
@@ -100,7 +106,7 @@ class CARDPOLClassifier(nn.Module):
         for hidden_size in hidden_sizes:
             layers.append(nn.Linear(in_size, hidden_size))
             layers.append(nn.ReLU())
-            layers.append(nn.Dropout(0.1))
+            # layers.append(nn.Dropout(0.1))
             in_size = hidden_size
         
         # Output layer
@@ -161,8 +167,8 @@ class CARDPOLClassifier(nn.Module):
 class EncoderPretrainConfig:
     """Configuration for encoder pre-training."""
     # Training
-    learning_rate: float = 1e-4
-    classifier_learning_rate: float = 1e-4
+    learning_rate: float = 1e-3
+    classifier_learning_rate: float = 1e-3
     batch_size: int = 32
     trajectory_length: int = 10
     n_steps: int = 100000
@@ -177,12 +183,26 @@ class EncoderPretrainConfig:
     save_interval: int = 10000
     log_dir: str = "encoder_pretrain_logs"
     
+    # Wandb logging
+    use_wandb: bool = False
+    wandb_project: str = "encoder_pretrain"
+    wandb_entity: str = None  # None uses default entity
+    wandb_run_name: str = None  # None auto-generates name
+    wandb_tags: list = None  # Optional tags for the run
+    
+    # Validation
+    val_interval: int = 500  # How often to run validation (0 to disable)
+    val_batch_size: int = 64  # Batch size for validation
+    val_n_batches: int = 10  # Number of batches to use for validation
+    
     # Device
     device: str = "cuda:0"
     
     def __post_init__(self):
         if self.classifier_hidden_sizes is None:
             self.classifier_hidden_sizes = [256, 128]
+        if self.wandb_tags is None:
+            self.wandb_tags = []
 
 
 class EncoderPretrainer:
@@ -212,6 +232,7 @@ class EncoderPretrainer:
         config: EncoderPretrainConfig,
         loss_fn: Optional[Callable] = None,
         classifier: Optional[CARDPOLClassifier] = None,
+        val_combined_dataset: Optional[CombinedMDPDataset] = None,
     ):
         """
         Args:
@@ -223,9 +244,12 @@ class EncoderPretrainer:
                      and return a loss tensor. If None, uses cardpol_loss.
             classifier: Optional pre-initialized CARDPOLClassifier.
                        If None, one will be created based on config.
+            val_combined_dataset: Optional validation CombinedMDPDataset for
+                                  evaluating classifier accuracy during training.
         """
         self.cql = cql
         self.combined_dataset = combined_dataset
+        self.val_combined_dataset = val_combined_dataset
         self.config = config
         self.device = config.device
         
@@ -264,6 +288,37 @@ class EncoderPretrainer:
         
         # Logging
         self.writer = SummaryWriter(config.log_dir)
+        
+        # Initialize wandb if enabled
+        self.use_wandb = config.use_wandb and WANDB_AVAILABLE
+        if config.use_wandb and not WANDB_AVAILABLE:
+            print("Warning: wandb requested but not installed. Skipping wandb logging.")
+        if self.use_wandb:
+            wandb.init(
+                project=config.wandb_project,
+                entity=config.wandb_entity,
+                name=config.wandb_run_name,
+                tags=config.wandb_tags,
+                config={
+                    "learning_rate": config.learning_rate,
+                    "classifier_learning_rate": config.classifier_learning_rate,
+                    "batch_size": config.batch_size,
+                    "trajectory_length": config.trajectory_length,
+                    "n_steps": config.n_steps,
+                    "num_sources": config.num_sources,
+                    "classifier_hidden_sizes": config.classifier_hidden_sizes,
+                    "classifier_combine_mode": config.classifier_combine_mode,
+                    "val_interval": config.val_interval,
+                    "val_batch_size": config.val_batch_size,
+                    "val_n_batches": config.val_n_batches,
+                    "encoder_feature_size": encoder_feature_size,
+                    "num_encoders": len(self.encoders),
+                    "device": config.device,
+                },
+            )
+            # Watch encoder and classifier models for gradient tracking
+            wandb.watch(self.encoders[0], log="gradients", log_freq=config.log_interval)
+            wandb.watch(self.classifier, log="gradients", log_freq=config.log_interval)
     
     def _compute_encoder_feature_size(self) -> int:
         """Compute the output feature size of the encoder."""
@@ -364,6 +419,102 @@ class EncoderPretrainer:
         
         return all_metrics
     
+    @torch.no_grad()
+    def validate(self) -> Dict[str, float]:
+        """
+        Run validation on the validation dataset.
+        
+        Returns:
+            Dictionary of validation metrics including accuracy and loss.
+        """
+        if self.val_combined_dataset is None:
+            return {}
+        
+        # Set models to eval mode
+        for encoder in self.encoders:
+            encoder.eval()
+        self.classifier.eval()
+        
+        total_loss = 0.0
+        total_correct = 0
+        total_samples = 0
+        all_predictions = []
+        all_labels = []
+        
+        for _ in range(self.config.val_n_batches):
+            # Sample validation batch
+            batch_with_source = self.val_combined_dataset.sample_trajectory_batch(
+                batch_size=self.config.val_batch_size,
+                length=self.config.trajectory_length,
+            )
+            trajectory_batch, source_ids = self._prepare_trajectory_batch(batch_with_source)
+            
+            # Get observations
+            observations = trajectory_batch.observations
+            batch_size, seq_len = observations.shape[:2]
+            
+            if seq_len < 2:
+                continue
+            
+            # Convert to tensor if numpy array
+            if isinstance(observations, np.ndarray):
+                observations = torch.from_numpy(observations)
+            
+            # Get observation at t=0 for all trajectories and normalize
+            obs_t0 = normalize_pixel_obs(observations[:, 0].to(self.device))
+            
+            # Sample random timesteps
+            random_t = torch.randint(1, seq_len, (batch_size,))
+            obs_t_random = normalize_pixel_obs(
+                observations[torch.arange(batch_size), random_t].to(self.device)
+            )
+            
+            # Encode observations
+            embedding_t0 = self.encoders[0](obs_t0)
+            embedding_t_random = self.encoders[0](obs_t_random)
+            
+            # Get predictions
+            logits = self.classifier(embedding_t0, embedding_t_random)
+            labels = torch.tensor(source_ids, dtype=torch.long, device=self.device)
+            
+            # Compute loss
+            loss = nn.functional.cross_entropy(logits, labels)
+            total_loss += loss.item() * batch_size
+            
+            # Compute accuracy
+            predictions = torch.argmax(logits, dim=-1)
+            total_correct += (predictions == labels).sum().item()
+            total_samples += batch_size
+            
+            # Store for per-class metrics
+            all_predictions.extend(predictions.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+        
+        # Set models back to train mode
+        for encoder in self.encoders:
+            encoder.train()
+        self.classifier.train()
+        
+        if total_samples == 0:
+            return {"val_accuracy": 0.0, "val_loss": 0.0}
+        
+        val_metrics = {
+            "val_accuracy": total_correct / total_samples,
+            "val_loss": total_loss / total_samples,
+        }
+        
+        # Compute per-class accuracy if we have enough data
+        all_predictions = np.array(all_predictions)
+        all_labels = np.array(all_labels)
+        
+        for source_id in range(self.config.num_sources):
+            mask = all_labels == source_id
+            if mask.sum() > 0:
+                class_acc = (all_predictions[mask] == source_id).mean()
+                val_metrics[f"val_accuracy_source_{source_id}"] = class_acc
+        
+        return val_metrics
+    
     def pretrain(self) -> None:
         """Run the full pre-training loop."""
         print(f"Starting encoder pre-training for {self.config.n_steps} steps...")
@@ -371,14 +522,47 @@ class EncoderPretrainer:
         print(f"Number of encoders: {len(self.encoders)}")
         print(f"Encoder feature size: {self.get_encoder_feature_size()}")
         print(f"Logging to: {self.config.log_dir}")
+        if self.use_wandb:
+            print(f"Wandb logging enabled: {self.config.wandb_project}")
+        if self.val_combined_dataset is not None:
+            print(f"Validation enabled: every {self.config.val_interval} steps")
+        else:
+            print("Validation: disabled (no validation dataset provided)")
         print("-" * 50)
         
+        best_val_accuracy = 0.0
         for step in range(1, self.config.n_steps + 1):
             metrics = self.pretrain_step()
             
-            # Log metrics
+            # Log metrics to tensorboard
             for name, value in metrics.items():
                 self.writer.add_scalar(f"pretrain/{name}", value, step)
+            
+            # Log metrics to wandb
+            if self.use_wandb:
+                wandb.log({f"train/{k}": v for k, v in metrics.items()}, step=step)
+            
+            # Run validation
+            if (self.config.val_interval > 0 and 
+                self.val_combined_dataset is not None and 
+                step % self.config.val_interval == 0):
+                val_metrics = self.validate()
+                for name, value in val_metrics.items():
+                    self.writer.add_scalar(f"pretrain/{name}", value, step)
+                
+                # Log validation metrics to wandb
+                if self.use_wandb:
+                    wandb.log({f"val/{k}": v for k, v in val_metrics.items()}, step=step)
+                    
+                    # Track best validation accuracy
+                    if val_metrics.get("val_accuracy", 0) > best_val_accuracy:
+                        best_val_accuracy = val_metrics["val_accuracy"]
+                        wandb.run.summary["best_val_accuracy"] = best_val_accuracy
+                        wandb.run.summary["best_val_step"] = step
+                
+                # Print validation metrics
+                val_str = ", ".join(f"{k}: {v:.4f}" for k, v in val_metrics.items())
+                print(f"Step {step}/{self.config.n_steps} - VALIDATION - {val_str}")
             
             # Print progress
             if step % self.config.log_interval == 0:
@@ -392,9 +576,35 @@ class EncoderPretrainer:
                 )
                 self.save_encoder_weights(checkpoint_path)
                 print(f"Saved checkpoint to {checkpoint_path}")
+                
+                # Log checkpoint artifact to wandb
+                if self.use_wandb:
+                    artifact = wandb.Artifact(
+                        f"encoder_checkpoint_{step}", 
+                        type="model",
+                        description=f"Encoder checkpoint at step {step}"
+                    )
+                    artifact.add_file(checkpoint_path)
+                    wandb.log_artifact(artifact)
+        
+        # Run final validation
+        if self.val_combined_dataset is not None:
+            print("\nFinal validation:")
+            val_metrics = self.validate()
+            val_str = ", ".join(f"{k}: {v:.4f}" for k, v in val_metrics.items())
+            print(f"  {val_str}")
+            
+            # Log final validation metrics to wandb summary
+            if self.use_wandb:
+                for k, v in val_metrics.items():
+                    wandb.run.summary[f"final_{k}"] = v
         
         print("Pre-training complete!")
         self.writer.close()
+        
+        # Finish wandb run
+        if self.use_wandb:
+            wandb.finish()
     
     def save_encoder_weights(self, path: str, include_classifier: bool = True) -> None:
         """
@@ -484,6 +694,24 @@ def load_pretrained_encoder_to_cql(
 
 
 # =============================================================================
+# Helper Functions
+# =============================================================================
+
+def normalize_pixel_obs(obs: torch.Tensor) -> torch.Tensor:
+    """
+    Normalize pixel observations from [0, 255] to [-1, 1].
+    
+    Args:
+        obs: Tensor with pixel values in range [0, 255].
+        
+    Returns:
+        Normalized tensor with values in range [-1, 1].
+    """
+    # Convert to float and normalize: [0, 255] -> [0, 1] -> [-1, 1]
+    return obs.float() / 127.5 - 1.0
+
+
+# =============================================================================
 # Loss Functions
 # =============================================================================
 
@@ -525,6 +753,10 @@ def cardpol_loss(
         # Need at least 2 timesteps
         return torch.tensor(0.0, device=device, requires_grad=True), {"accuracy": 0.0}
     
+    # Convert to tensor if numpy array
+    if isinstance(observations, np.ndarray):
+        observations = torch.from_numpy(observations)
+    
     # Get observation at t=0 for all trajectories
     obs_t0 = observations[:, 0]  # (batch, *obs_shape)
     
@@ -535,9 +767,9 @@ def cardpol_loss(
     # We need to index each batch element with its corresponding random timestep
     obs_t_random = observations[torch.arange(batch_size), random_t]  # (batch, *obs_shape)
     
-    # Move to device and convert to float
-    obs_t0 = obs_t0.to(device).float()
-    obs_t_random = obs_t_random.to(device).float()
+    # Move to device and normalize pixel observations from [0, 255] to [-1, 1]
+    obs_t0 = normalize_pixel_obs(obs_t0.to(device))
+    obs_t_random = normalize_pixel_obs(obs_t_random.to(device))
     
     # Encode both observations
     embedding_t0 = encoder(obs_t0)  # (batch, feature_dim)
@@ -563,175 +795,6 @@ def cardpol_loss(
     return loss, metrics
 
 
-def cardpol_loss_with_temporal_regularization(
-    encoder: nn.Module,
-    classifier: CARDPOLClassifier,
-    trajectory_batch: TrajectoryMiniBatch,
-    source_ids: np.ndarray,
-    device: str = "cuda:0",
-    temporal_weight: float = 0.1,
-) -> tuple:
-    """
-    CARDPOL loss with temporal regularization.
-    
-    Same as cardpol_loss, but also encourages embeddings at different 
-    timesteps within the same trajectory to be similar (temporal consistency).
-    
-    Args:
-        encoder: The encoder network to train.
-        classifier: The CARDPOLClassifier network.
-        trajectory_batch: Batch of trajectories.
-        source_ids: Array of source dataset IDs for each trajectory.
-        device: Device to run computations on.
-        temporal_weight: Weight for the temporal consistency loss.
-    
-    Returns:
-        Tuple of (loss, metrics_dict)
-    """
-    observations = trajectory_batch.observations
-    batch_size, seq_len = observations.shape[:2]
-    obs_shape = observations.shape[2:]
-    
-    if seq_len < 2:
-        return torch.tensor(0.0, device=device, requires_grad=True), {"accuracy": 0.0}
-    
-    # Get observation at t=0
-    obs_t0 = observations[:, 0].to(device).float()
-    
-    # Sample random timestep from [1, seq_len)
-    random_t = torch.randint(1, seq_len, (batch_size,))
-    obs_t_random = observations[torch.arange(batch_size), random_t].to(device).float()
-    
-    # Encode both observations
-    embedding_t0 = encoder(obs_t0)
-    embedding_t_random = encoder(obs_t_random)
-    
-    # Source prediction loss
-    logits = classifier(embedding_t0, embedding_t_random)
-    labels = torch.tensor(source_ids, dtype=torch.long, device=device)
-    classification_loss = nn.functional.cross_entropy(logits, labels)
-    
-    # Temporal consistency loss (embeddings should be similar within a trajectory)
-    temporal_loss = torch.mean((embedding_t0 - embedding_t_random) ** 2)
-    
-    # Combined loss
-    loss = classification_loss + temporal_weight * temporal_loss
-    
-    # Compute metrics
-    with torch.no_grad():
-        predictions = torch.argmax(logits, dim=-1)
-        accuracy = (predictions == labels).float().mean().item()
-    
-    metrics = {
-        "accuracy": accuracy,
-        "classification_loss": classification_loss.item(),
-        "temporal_loss": temporal_loss.item(),
-        "avg_timestep": random_t.float().mean().item(),
-    }
-    
-    return loss, metrics
-
-
-def cardpol_contrastive_loss(
-    encoder: nn.Module,
-    classifier: CARDPOLClassifier,
-    trajectory_batch: TrajectoryMiniBatch,
-    source_ids: np.ndarray,
-    device: str = "cuda:0",
-    contrastive_weight: float = 0.5,
-    temperature: float = 0.1,
-) -> tuple:
-    """
-    CARDPOL loss with contrastive regularization.
-    
-    Combines CARDPOL source prediction with a contrastive objective that
-    pulls together embeddings from the same source policy and pushes apart
-    embeddings from different source policies.
-    
-    Args:
-        encoder: The encoder network to train.
-        classifier: The CARDPOLClassifier network.
-        trajectory_batch: Batch of trajectories.
-        source_ids: Array of source dataset IDs for each trajectory.
-        device: Device to run computations on.
-        contrastive_weight: Weight for the contrastive loss term.
-        temperature: Temperature for contrastive loss.
-    
-    Returns:
-        Tuple of (loss, metrics_dict)
-    """
-    observations = trajectory_batch.observations
-    batch_size, seq_len = observations.shape[:2]
-    
-    if seq_len < 2:
-        return torch.tensor(0.0, device=device, requires_grad=True), {"accuracy": 0.0}
-    
-    # Get observations at t=0 and random t
-    obs_t0 = observations[:, 0].to(device).float()
-    random_t = torch.randint(1, seq_len, (batch_size,))
-    obs_t_random = observations[torch.arange(batch_size), random_t].to(device).float()
-    
-    # Encode observations
-    embedding_t0 = encoder(obs_t0)
-    embedding_t_random = encoder(obs_t_random)
-    
-    # Source prediction loss
-    logits = classifier(embedding_t0, embedding_t_random)
-    labels = torch.tensor(source_ids, dtype=torch.long, device=device)
-    classification_loss = nn.functional.cross_entropy(logits, labels)
-    
-    # Contrastive loss: pull together same-source, push apart different-source
-    # Concatenate embeddings for contrastive computation
-    all_embeddings = torch.cat([embedding_t0, embedding_t_random], dim=0)  # (2*batch, feature_dim)
-    all_embeddings = nn.functional.normalize(all_embeddings, dim=-1)
-    all_labels = torch.cat([labels, labels], dim=0)  # (2*batch,)
-    
-    # Compute similarity matrix
-    similarity = torch.mm(all_embeddings, all_embeddings.t()) / temperature  # (2*batch, 2*batch)
-    
-    # Create mask for positive pairs (same source)
-    label_matrix = all_labels.unsqueeze(0) == all_labels.unsqueeze(1)  # (2*batch, 2*batch)
-    
-    # Remove diagonal (self-similarity)
-    mask = ~torch.eye(similarity.shape[0], dtype=torch.bool, device=device)
-    
-    # Supervised contrastive loss
-    positive_mask = label_matrix & mask
-    negative_mask = ~label_matrix & mask
-    
-    if positive_mask.any():
-        # For each anchor, compute loss over its positive and negative pairs
-        exp_sim = torch.exp(similarity) * mask.float()
-        
-        # Sum of exp similarities with negatives + positives
-        denominator = exp_sim.sum(dim=1, keepdim=True)
-        
-        # Log probability of positive pairs
-        log_prob = similarity - torch.log(denominator + 1e-8)
-        
-        # Average over positive pairs
-        contrastive_loss = -(log_prob * positive_mask.float()).sum() / positive_mask.float().sum()
-    else:
-        contrastive_loss = torch.tensor(0.0, device=device)
-    
-    # Combined loss
-    loss = classification_loss + contrastive_weight * contrastive_loss
-    
-    # Compute metrics
-    with torch.no_grad():
-        predictions = torch.argmax(logits, dim=-1)
-        accuracy = (predictions == labels).float().mean().item()
-    
-    metrics = {
-        "accuracy": accuracy,
-        "classification_loss": classification_loss.item(),
-        "contrastive_loss": contrastive_loss.item() if isinstance(contrastive_loss, torch.Tensor) else contrastive_loss,
-        "avg_timestep": random_t.float().mean().item(),
-    }
-    
-    return loss, metrics
-
-
 # =============================================================================
 # Main script
 # =============================================================================
@@ -740,6 +803,7 @@ if __name__ == "__main__":
     import gymnasium as gym
     import ale_py
     from gymnasium.wrappers import AtariPreprocessing, ResizeObservation, FrameStackObservation
+    from datetime import datetime
     
     def make_env(env_id: str):
         env = gym.make(env_id)
@@ -751,19 +815,37 @@ if __name__ == "__main__":
     
     # Configuration
     data_paths = [
-        '/u/mrudolph/documents/rl-baselines3-zoo/atari_data/a2c_QbertNoFrameskip-v4_0_100000.pth',
-        '/u/mrudolph/documents/rl-baselines3-zoo/atari_data/dqn_QbertNoFrameskip-v4_0_100000.pth',
+        'atari_data/QbertNoFrameskip-v4/dqn/ckpt_0_100000.pth',
+        'atari_data/QbertNoFrameskip-v4/dqn/ckpt_1_100000.pth',
+        'atari_data/QbertNoFrameskip-v4/dqn/ckpt_2_100000.pth',
+        'atari_data/QbertNoFrameskip-v4/dqn/ckpt_3_100000.pth',
+        'atari_data/QbertNoFrameskip-v4/dqn/ckpt_4_100000.pth',
+        'atari_data/QbertNoFrameskip-v4/dqn/ckpt_5_100000.pth',
+        'atari_data/QbertNoFrameskip-v4/dqn/ckpt_6_100000.pth',
+        'atari_data/QbertNoFrameskip-v4/dqn/ckpt_7_100000.pth',   
     ]
-    env_id = "QbertNoFrameskip-v4"
-    log_dir = 'encoder_pretrain_qbert'
-    device = 'cuda:0'
     
-    # Create environment
+    val_data_paths = [
+        'atari_data/QbertNoFrameskip-v4/dqn/ckpt_0_10000.pth',
+        'atari_data/QbertNoFrameskip-v4/dqn/ckpt_1_10000.pth',
+        'atari_data/QbertNoFrameskip-v4/dqn/ckpt_2_10000.pth',
+        'atari_data/QbertNoFrameskip-v4/dqn/ckpt_3_10000.pth',
+        'atari_data/QbertNoFrameskip-v4/dqn/ckpt_4_10000.pth',
+        'atari_data/QbertNoFrameskip-v4/dqn/ckpt_5_10000.pth',
+        'atari_data/QbertNoFrameskip-v4/dqn/ckpt_6_10000.pth',
+        'atari_data/QbertNoFrameskip-v4/dqn/ckpt_7_10000.pth',   
+    ]
+    
+    labels = [0, 1, 2, 3, 4, 5, 6, 7]
+    log_dir = 'encoder_pretrain_atari'
+    device = 'cuda:0'
+    env_id = "QbertNoFrameskip-v4"
     env = make_env(env_id)
     
     # Load datasets
     print("Loading datasets...")
     datasets = []
+    val_datasets = []
     for data_path in data_paths:
         if os.path.exists(data_path):
             data = torch.load(data_path, weights_only=False)
@@ -779,7 +861,22 @@ if __name__ == "__main__":
             print(f"  Loaded {data_path}")
         else:
             print(f"  Warning: {data_path} not found, skipping...")
-    
+    for data_path in val_data_paths:
+        if os.path.exists(data_path):
+            data = torch.load(data_path, weights_only=False)
+            dataset = d3rlpy.dataset.MDPDataset(
+                observations=data['obs'],
+                actions=data['action'],
+                rewards=data['reward'],
+                terminals=data['done'],
+                action_space=d3rlpy.constants.ActionSpace.DISCRETE,
+                action_size=env.action_space.n,
+            )
+            val_datasets.append(dataset)
+            print(f"  Loaded {data_path}")
+        else:
+            print(f"  Warning: {data_path} not found, skipping...")
+            
     if len(datasets) == 0:
         print("No datasets found! Exiting.")
         sys.exit(1)
@@ -787,7 +884,7 @@ if __name__ == "__main__":
     # Create combined dataset
     combined = CombinedMDPDataset(
         datasets=datasets,
-        names=["a2c", "dqn"][:len(datasets)],
+        names=labels[:len(datasets)],
     )
     print(f"\n{combined}\n")
     
@@ -807,7 +904,7 @@ if __name__ == "__main__":
     config = EncoderPretrainConfig(
         learning_rate=1e-4,
         classifier_learning_rate=1e-4,
-        batch_size=32,
+        batch_size=512,
         trajectory_length=10,
         n_steps=10000,  # Reduced for demonstration
         num_sources=len(datasets),
@@ -817,7 +914,25 @@ if __name__ == "__main__":
         save_interval=2000,
         log_dir=log_dir,
         device=device,
+        # Validation settings
+        val_interval=500,  # Validate every 500 steps (0 to disable)
+        val_batch_size=64,
+        val_n_batches=10,
+        # Wandb settings
+        use_wandb=True,
+        wandb_project="cardpol_atari_pretrain",
+        wandb_run_name=f"cardpol_{env_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        wandb_tags=["cardpol", "encoder_pretrain", env_id],
     )
+    
+    # Optional: Create a validation dataset
+    # In practice, you would load separate validation data files
+    # Here we demonstrate by reusing the same datasets (not ideal, just for demo)
+    val_combined = CombinedMDPDataset(
+        datasets=datasets,
+        names=labels[:len(datasets)],
+    )
+    print(f"Validation dataset: {val_combined}\n")
     
     # Create pre-trainer with the pairwise source prediction loss
     # The default loss is cardpol_loss which:
@@ -829,6 +944,7 @@ if __name__ == "__main__":
         combined_dataset=combined,
         config=config,
         loss_fn=cardpol_loss,  # Default loss
+        val_combined_dataset=val_combined,  # Optional: validation dataset
         # Alternative losses:
         # loss_fn=cardpol_loss_with_temporal_regularization,
         # loss_fn=cardpol_contrastive_loss,

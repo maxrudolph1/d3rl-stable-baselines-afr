@@ -24,3 +24,7 @@ dist
 /.vscode/
 **/*.mp4
 **/*.png
+wandb/
+atari_data
+encoder_pretrain_atari
+encoder_pretrain_qbert
