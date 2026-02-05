@@ -14,6 +14,7 @@ from afr_scripts.pretrainer import (
     EncoderPretrainer,
     load_pretrained_encoder_to_cql,
 )
+from afr_scripts.utils import make_atari_env
 
 __all__ = [
     # Config
@@ -31,4 +32,6 @@ __all__ = [
     "EncoderPretrainConfig",
     "EncoderPretrainer",
     "load_pretrained_encoder_to_cql",
+    # Utils
+    "make_atari_env",
 ]

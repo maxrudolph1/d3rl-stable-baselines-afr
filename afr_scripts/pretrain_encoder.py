@@ -29,6 +29,7 @@ from afr_scripts.config import load_data_config
 from afr_scripts.extended_dataset import CombinedMDPDataset
 from afr_scripts.losses import cardpol_loss
 from afr_scripts.pretrainer import EncoderPretrainConfig, EncoderPretrainer
+from afr_scripts.utils import make_atari_env
 
 
 def main():
@@ -85,21 +86,7 @@ def main():
     print(f"Validation data paths: {len(val_data_paths)}")
 
     # Create environment for action space info
-    import gymnasium as gym
-    import ale_py  # noqa: F401  (registers Atari envs)
-    from gymnasium.wrappers import AtariPreprocessing, ResizeObservation, FrameStackObservation
-
-    def make_env(env_id: str):
-        env = gym.make(env_id)
-        env = AtariPreprocessing(
-            env, screen_size=84, frame_skip=4,
-            terminal_on_life_loss=False, grayscale_obs=True, noop_max=30
-        )
-        env = ResizeObservation(env, (84, 84))
-        env = FrameStackObservation(env, 4)
-        return env
-
-    env = make_env(env_id)
+    env = make_atari_env(env_id)
 
     # Load datasets
     print("\nLoading datasets...")
@@ -161,6 +148,13 @@ def main():
     # Build the model with one of the datasets
     cql.build_with_dataset(datasets[0])
     print("CQL model built.")
+    
+    # Save the model
+    time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = f"{args.log_dir}/{env_id}/{time_stamp}/"
+    os.makedirs(log_dir, exist_ok=True)
+    # cql.save(log_dir)
+    print(f"Model saved to {log_dir}")
 
     # Create pre-trainer config
     config = EncoderPretrainConfig(
@@ -174,7 +168,7 @@ def main():
         classifier_combine_mode="concat",
         log_interval=100,
         save_interval=2000,
-        log_dir=args.log_dir,
+        log_dir=log_dir,
         device=args.device,
         # Validation settings
         val_interval=500,
@@ -224,7 +218,7 @@ def main():
     pretrainer.pretrain()
 
     # Save final encoder weights
-    final_weights_path = os.path.join(args.log_dir, "encoder_final.pt")
+    final_weights_path = os.path.join(log_dir, "encoder_final.pt")
     pretrainer.save_encoder_weights(final_weights_path)
 
     print("\n" + "=" * 50)
