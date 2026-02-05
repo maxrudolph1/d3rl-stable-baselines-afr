@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 Path_root = Path(os.path.dirname(os.path.abspath(__file__))).parent
 sys.path.insert(0, str(Path_root))
-from afr_scripts.collect_atari_data import make_env
+from afr.collect_atari_data import make_env
 import torch
 
 data_path = '/u/mrudolph/documents/rl-baselines3-zoo/atari_data/a2c_QbertNoFrameskip-v4_0_100000.pth'
@@ -43,7 +43,6 @@ cql = d3rlpy.algos.DiscreteCQLConfig(
 ).create(device='cuda:0')
 
 cql.build_with_dataset(dataset)
-
 # start training
 from d3rlpy.logging import FileAdapterFactory
 

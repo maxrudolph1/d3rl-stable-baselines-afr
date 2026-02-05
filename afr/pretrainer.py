@@ -23,9 +23,9 @@ except ImportError:
 
 import d3rlpy
 
-from afr_scripts.classifier import CARDPOLClassifier
-from afr_scripts.extended_dataset import CombinedMDPDataset, TrajectoryBatchWithSource
-from afr_scripts.losses import cardpol_loss, normalize_pixel_obs
+from afr.classifier import CARDPOLClassifier, BehaviorCloningHead
+from afr.extended_dataset import CombinedMDPDataset, TrajectoryBatchWithSource
+from afr.losses import cardpol_loss, bc_loss, normalize_pixel_obs
 
 
 @dataclass
@@ -43,6 +43,13 @@ class EncoderPretrainConfig:
     num_sources: int = 2
     classifier_hidden_sizes: list = None  # Default: [256, 128]
     classifier_combine_mode: str = "concat"  # 'concat', 'diff', or 'concat_diff'
+
+    # Behavior Cloning head configuration
+    use_bc_head: bool = False  # Whether to train a BC head alongside CARDPOL
+    bc_learning_rate: float = 1e-3
+    bc_hidden_sizes: list = None  # Default: [256, 128]
+    bc_loss_weight: float = 1.0  # Weight for BC loss relative to CARDPOL loss
+    num_actions: int = None  # Number of discrete actions (required if use_bc_head=True)
 
     # Logging
     log_interval: int = 100
@@ -67,8 +74,12 @@ class EncoderPretrainConfig:
     def __post_init__(self):
         if self.classifier_hidden_sizes is None:
             self.classifier_hidden_sizes = [256, 128]
+        if self.bc_hidden_sizes is None:
+            self.bc_hidden_sizes = [256, 128]
         if self.wandb_tags is None:
             self.wandb_tags = []
+        if self.use_bc_head and self.num_actions is None:
+            raise ValueError("num_actions must be specified when use_bc_head=True")
 
 
 class EncoderPretrainer:
@@ -98,6 +109,7 @@ class EncoderPretrainer:
         config: EncoderPretrainConfig,
         loss_fn: Optional[Callable] = None,
         classifier: Optional[CARDPOLClassifier] = None,
+        bc_head: Optional[BehaviorCloningHead] = None,
         val_combined_dataset: Optional[CombinedMDPDataset] = None,
     ):
         """
@@ -110,6 +122,8 @@ class EncoderPretrainer:
                      and return a loss tensor. If None, uses cardpol_loss.
             classifier: Optional pre-initialized CARDPOLClassifier.
                        If None, one will be created based on config.
+            bc_head: Optional pre-initialized BehaviorCloningHead.
+                    If None and config.use_bc_head=True, one will be created.
             val_combined_dataset: Optional validation CombinedMDPDataset for
                                   evaluating classifier accuracy during training.
         """
@@ -136,6 +150,24 @@ class EncoderPretrainer:
                 combine_mode=config.classifier_combine_mode,
             ).to(self.device)
 
+        # Create or use provided BC head (if enabled)
+        self.bc_head = None
+        self.bc_optimizer = None
+        if config.use_bc_head:
+            if bc_head is not None:
+                self.bc_head = bc_head.to(self.device)
+            else:
+                self.bc_head = BehaviorCloningHead(
+                    embedding_size=encoder_feature_size,
+                    num_actions=config.num_actions,
+                    hidden_sizes=config.bc_hidden_sizes,
+                ).to(self.device)
+            # Set up optimizer for BC head parameters
+            self.bc_optimizer = optim.Adam(
+                self.bc_head.parameters(),
+                lr=config.bc_learning_rate
+            )
+
         # Set up optimizer for encoder parameters
         encoder_params = []
         for encoder in self.encoders:
@@ -159,31 +191,40 @@ class EncoderPretrainer:
         if config.use_wandb and not WANDB_AVAILABLE:
             print("Warning: wandb requested but not installed. Skipping wandb logging.")
         if self.use_wandb:
+            wandb_config = {
+                "learning_rate": config.learning_rate,
+                "classifier_learning_rate": config.classifier_learning_rate,
+                "batch_size": config.batch_size,
+                "trajectory_length": config.trajectory_length,
+                "n_steps": config.n_steps,
+                "num_sources": config.num_sources,
+                "classifier_hidden_sizes": config.classifier_hidden_sizes,
+                "classifier_combine_mode": config.classifier_combine_mode,
+                "val_interval": config.val_interval,
+                "val_batch_size": config.val_batch_size,
+                "val_n_batches": config.val_n_batches,
+                "encoder_feature_size": encoder_feature_size,
+                "num_encoders": len(self.encoders),
+                "device": config.device,
+                # BC head config
+                "use_bc_head": config.use_bc_head,
+                "bc_learning_rate": config.bc_learning_rate,
+                "bc_hidden_sizes": config.bc_hidden_sizes,
+                "bc_loss_weight": config.bc_loss_weight,
+                "num_actions": config.num_actions,
+            }
             wandb.init(
                 project=config.wandb_project,
                 entity=config.wandb_entity,
                 name=config.wandb_run_name,
                 tags=config.wandb_tags,
-                config={
-                    "learning_rate": config.learning_rate,
-                    "classifier_learning_rate": config.classifier_learning_rate,
-                    "batch_size": config.batch_size,
-                    "trajectory_length": config.trajectory_length,
-                    "n_steps": config.n_steps,
-                    "num_sources": config.num_sources,
-                    "classifier_hidden_sizes": config.classifier_hidden_sizes,
-                    "classifier_combine_mode": config.classifier_combine_mode,
-                    "val_interval": config.val_interval,
-                    "val_batch_size": config.val_batch_size,
-                    "val_n_batches": config.val_n_batches,
-                    "encoder_feature_size": encoder_feature_size,
-                    "num_encoders": len(self.encoders),
-                    "device": config.device,
-                },
+                config=wandb_config,
             )
             # Watch encoder and classifier models for gradient tracking
             wandb.watch(self.encoders[0], log="gradients", log_freq=config.log_interval)
             wandb.watch(self.classifier, log="gradients", log_freq=config.log_interval)
+            if self.bc_head is not None:
+                wandb.watch(self.bc_head, log="gradients", log_freq=config.log_interval)
 
     def _compute_encoder_feature_size(self) -> int:
         """Compute the output feature size of the encoder."""
@@ -242,9 +283,11 @@ class EncoderPretrainer:
         for encoder in self.encoders:
             encoder.train()
         self.classifier.train()
+        if self.bc_head is not None:
+            self.bc_head.train()
 
         # Use the first encoder for the loss (they share the same architecture)
-        loss, metrics = self.loss_fn(
+        cardpol_loss_val, metrics = self.loss_fn(
             encoder=self.encoders[0],
             classifier=self.classifier,
             trajectory_batch=trajectory_batch,
@@ -262,19 +305,44 @@ class EncoderPretrainer:
                     source_ids=source_ids,
                     device=self.device,
                 )
-                loss = loss + additional_loss
-            loss = loss / len(self.encoders)
+                cardpol_loss_val = cardpol_loss_val + additional_loss
+            cardpol_loss_val = cardpol_loss_val / len(self.encoders)
 
-        # Backward pass
+        # Backward pass for CARDPOL loss (updates encoder + classifier)
         self.encoder_optimizer.zero_grad()
         self.classifier_optimizer.zero_grad()
-        loss.backward()
+        cardpol_loss_val.backward()
         self.encoder_optimizer.step()
         self.classifier_optimizer.step()
 
         # Collect metrics
-        all_metrics["loss"] = loss.item()
+        all_metrics["cardpol_loss"] = cardpol_loss_val.item()
         all_metrics.update(metrics)
+
+        # Compute BC loss if BC head is enabled
+        # Note: BC loss does NOT backpropagate to encoder (embedding is detached)
+        if self.bc_head is not None:
+            bc_loss_val, bc_metrics = bc_loss(
+                encoder=self.encoders[0],
+                bc_head=self.bc_head,
+                trajectory_batch=trajectory_batch,
+                device=self.device,
+                detach_encoder=True,  # Prevents gradients flowing to encoder
+            )
+
+            # Backward pass for BC loss (only updates BC head)
+            self.bc_optimizer.zero_grad()
+            bc_loss_val.backward()
+            self.bc_optimizer.step()
+
+            all_metrics["bc_loss"] = bc_loss_val.item()
+            all_metrics.update(bc_metrics)
+
+        # Compute total loss for logging (weighted sum)
+        total_loss = cardpol_loss_val.item()
+        if self.bc_head is not None:
+            total_loss += self.config.bc_loss_weight * bc_loss_val.item()
+        all_metrics["loss"] = total_loss
 
         return all_metrics
 
@@ -293,12 +361,19 @@ class EncoderPretrainer:
         for encoder in self.encoders:
             encoder.eval()
         self.classifier.eval()
+        if self.bc_head is not None:
+            self.bc_head.eval()
 
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
         all_predictions = []
         all_labels = []
+
+        # BC validation metrics
+        bc_total_loss = 0.0
+        bc_total_correct = 0
+        bc_total_samples = 0
 
         for _ in range(self.config.val_n_batches):
             # Sample validation batch
@@ -308,8 +383,9 @@ class EncoderPretrainer:
             )
             trajectory_batch, source_ids = self._prepare_trajectory_batch(batch_with_source)
 
-            # Get observations
+            # Get observations and actions
             observations = trajectory_batch.observations
+            actions = trajectory_batch.actions
             batch_size, seq_len = observations.shape[:2]
 
             if seq_len < 2:
@@ -318,6 +394,8 @@ class EncoderPretrainer:
             # Convert to tensor if numpy array
             if isinstance(observations, np.ndarray):
                 observations = torch.from_numpy(observations)
+            if isinstance(actions, np.ndarray):
+                actions = torch.from_numpy(actions)
 
             # Get observation at t=0 for all trajectories and normalize
             obs_t0 = normalize_pixel_obs(observations[:, 0].to(self.device))
@@ -332,15 +410,15 @@ class EncoderPretrainer:
             embedding_t0 = self.encoders[0](obs_t0)
             embedding_t_random = self.encoders[0](obs_t_random)
 
-            # Get predictions
+            # Get CARDPOL predictions
             logits = self.classifier(embedding_t0, embedding_t_random)
             labels = torch.tensor(source_ids, dtype=torch.long, device=self.device)
 
-            # Compute loss
+            # Compute CARDPOL loss
             loss = nn.functional.cross_entropy(logits, labels)
             total_loss += loss.item() * batch_size
 
-            # Compute accuracy
+            # Compute CARDPOL accuracy
             predictions = torch.argmax(logits, dim=-1)
             total_correct += (predictions == labels).sum().item()
             total_samples += batch_size
@@ -349,10 +427,22 @@ class EncoderPretrainer:
             all_predictions.extend(predictions.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
 
+            # Compute BC validation metrics if BC head is enabled
+            if self.bc_head is not None:
+                action_t0 = actions[:, 0].long().to(self.device)
+                bc_logits = self.bc_head(embedding_t0.detach())
+                bc_loss_val = nn.functional.cross_entropy(bc_logits, action_t0)
+                bc_total_loss += bc_loss_val.item() * batch_size
+                bc_predictions = torch.argmax(bc_logits, dim=-1)
+                bc_total_correct += (bc_predictions == action_t0).sum().item()
+                bc_total_samples += batch_size
+
         # Set models back to train mode
         for encoder in self.encoders:
             encoder.train()
         self.classifier.train()
+        if self.bc_head is not None:
+            self.bc_head.train()
 
         if total_samples == 0:
             return {"val_accuracy": 0.0, "val_loss": 0.0}
@@ -372,6 +462,11 @@ class EncoderPretrainer:
                 class_acc = (all_predictions[mask] == source_id).mean()
                 val_metrics[f"val_accuracy_source_{source_id}"] = class_acc
 
+        # Add BC validation metrics
+        if self.bc_head is not None and bc_total_samples > 0:
+            val_metrics["val_bc_accuracy"] = bc_total_correct / bc_total_samples
+            val_metrics["val_bc_loss"] = bc_total_loss / bc_total_samples
+
         return val_metrics
 
     def pretrain(self) -> None:
@@ -387,6 +482,9 @@ class EncoderPretrainer:
             print(f"Validation enabled: every {self.config.val_interval} steps")
         else:
             print("Validation: disabled (no validation dataset provided)")
+        if self.bc_head is not None:
+            print(f"BC head enabled: {self.config.num_actions} actions, weight={self.config.bc_loss_weight}")
+            print(f"  NOTE: BC gradients do NOT backpropagate to encoder")
         print("-" * 50)
 
         best_val_accuracy = 0.0
@@ -465,13 +563,19 @@ class EncoderPretrainer:
         if self.use_wandb:
             wandb.finish()
 
-    def save_encoder_weights(self, path: str, include_classifier: bool = True) -> None:
+    def save_encoder_weights(
+        self,
+        path: str,
+        include_classifier: bool = True,
+        include_bc_head: bool = True,
+    ) -> None:
         """
-        Save encoder and classifier weights to a file.
+        Save encoder, classifier, and BC head weights to a file.
 
         Args:
             path: Path to save the weights.
             include_classifier: Whether to include classifier weights.
+            include_bc_head: Whether to include BC head weights.
         """
         state_dict = {}
         for i, encoder in enumerate(self.encoders):
@@ -485,26 +589,45 @@ class EncoderPretrainer:
                 "combine_mode": self.classifier.combine_mode,
             }
 
+        if include_bc_head and self.bc_head is not None:
+            state_dict["bc_head"] = self.bc_head.state_dict()
+            state_dict["bc_head_config"] = {
+                "embedding_size": self.bc_head.embedding_size,
+                "num_actions": self.bc_head.num_actions,
+            }
+
         torch.save(state_dict, path)
         print(f"Saved encoder weights to {path}")
 
-    def load_encoder_weights(self, path: str, load_classifier: bool = True) -> None:
+    def load_encoder_weights(
+        self,
+        path: str,
+        load_classifier: bool = True,
+        load_bc_head: bool = True,
+    ) -> None:
         """
-        Load encoder and classifier weights from a file.
+        Load encoder, classifier, and BC head weights from a file.
 
         Args:
             path: Path to load the weights from.
             load_classifier: Whether to load classifier weights.
+            load_bc_head: Whether to load BC head weights.
         """
         state_dict = torch.load(path, map_location=self.device)
         for i, encoder in enumerate(self.encoders):
             encoder.load_state_dict(state_dict[f"encoder_{i}"])
 
+        loaded_components = ["encoder"]
+
         if load_classifier and "classifier" in state_dict:
             self.classifier.load_state_dict(state_dict["classifier"])
-            print(f"Loaded encoder and classifier weights from {path}")
-        else:
-            print(f"Loaded encoder weights from {path}")
+            loaded_components.append("classifier")
+
+        if load_bc_head and "bc_head" in state_dict and self.bc_head is not None:
+            self.bc_head.load_state_dict(state_dict["bc_head"])
+            loaded_components.append("bc_head")
+
+        print(f"Loaded {', '.join(loaded_components)} weights from {path}")
 
 
 def load_pretrained_encoder_to_cql(

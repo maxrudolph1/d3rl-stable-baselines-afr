@@ -1,5 +1,5 @@
 # Example data config for CARDPOL encoder pre-training.
-# Pass with: python -m afr_scripts.pretrain_encoder --config afr_scripts/pretrain_data_config_example.yaml
+# Pass with: python -m afr.pretrain_encoder --config afr/pretrain_data_config_example.yaml
 #
 # Required:
 #   environment: name of the environment (e.g. for Atari or Gym)

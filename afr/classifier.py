@@ -115,3 +115,71 @@ class CARDPOLClassifier(nn.Module):
         """Get class predictions."""
         logits = self.forward(embedding1, embedding2)
         return torch.argmax(logits, dim=-1)
+
+
+class BehaviorCloningHead(nn.Module):
+    """
+    Behavior Cloning head for action prediction.
+
+    Takes a single embedding (e.g., from t0) and predicts the action.
+    This is trained with cross-entropy loss for discrete actions.
+
+    IMPORTANT: The embedding should be detached before being passed to this
+    head to prevent gradients from backpropagating into the encoder.
+
+    Args:
+        embedding_size: Size of the embedding from the encoder.
+        num_actions: Number of discrete actions to predict.
+        hidden_sizes: List of hidden layer sizes. Defaults to [256, 128].
+    """
+
+    def __init__(
+        self,
+        embedding_size: int,
+        num_actions: int,
+        hidden_sizes: list = None,
+    ):
+        super().__init__()
+
+        if hidden_sizes is None:
+            hidden_sizes = [256, 128]
+
+        self.embedding_size = embedding_size
+        self.num_actions = num_actions
+
+        # Build MLP layers
+        layers = []
+        in_size = embedding_size
+        for hidden_size in hidden_sizes:
+            layers.append(nn.Linear(in_size, hidden_size))
+            layers.append(nn.ReLU())
+            in_size = hidden_size
+
+        # Output layer
+        layers.append(nn.Linear(in_size, num_actions))
+
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, embedding: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through the BC head.
+
+        Args:
+            embedding: Embedding from encoder, shape (batch_size, embedding_size).
+                      Should be detached if you want to prevent gradient flow
+                      back to the encoder.
+
+        Returns:
+            Action logits of shape (batch_size, num_actions).
+        """
+        return self.network(embedding)
+
+    def predict_proba(self, embedding: torch.Tensor) -> torch.Tensor:
+        """Get action probability predictions."""
+        logits = self.forward(embedding)
+        return torch.softmax(logits, dim=-1)
+
+    def predict(self, embedding: torch.Tensor) -> torch.Tensor:
+        """Get action predictions."""
+        logits = self.forward(embedding)
+        return torch.argmax(logits, dim=-1)

@@ -8,7 +8,7 @@ import torch.nn as nn
 
 from d3rlpy.dataset import TrajectoryMiniBatch
 
-from afr_scripts.classifier import CARDPOLClassifier
+from afr.classifier import CARDPOLClassifier, BehaviorCloningHead
 
 
 def normalize_pixel_obs(obs: torch.Tensor) -> torch.Tensor:
@@ -97,6 +97,82 @@ def cardpol_loss(
     metrics = {
         "accuracy": accuracy,
         "avg_timestep": random_t.float().mean().item(),
+    }
+
+    return loss, metrics
+
+
+def bc_loss(
+    encoder: nn.Module,
+    bc_head: BehaviorCloningHead,
+    trajectory_batch: TrajectoryMiniBatch,
+    device: str = "cuda:0",
+    detach_encoder: bool = True,
+) -> tuple:
+    """
+    Behavior Cloning loss for action prediction from t0 embedding.
+
+    Takes the observation at t=0, encodes it, and predicts the action taken.
+    Uses cross-entropy loss for discrete actions.
+
+    IMPORTANT: By default, gradients do NOT backpropagate through the encoder.
+    The embedding is detached before being passed to the BC head, so only the
+    BC head parameters are updated by this loss.
+
+    Args:
+        encoder: The encoder network (gradients will NOT flow through if detach_encoder=True).
+        bc_head: The BehaviorCloningHead network to train.
+        trajectory_batch: Batch of trajectories.
+        device: Device to run computations on.
+        detach_encoder: If True, detach the embedding to prevent gradients from
+                       flowing back to the encoder. Defaults to True.
+
+    Returns:
+        Tuple of (loss, metrics_dict).
+    """
+    observations = trajectory_batch.observations  # (batch, seq, *obs_shape)
+    actions = trajectory_batch.actions  # (batch, seq) for discrete actions
+    batch_size, seq_len = observations.shape[:2]
+
+    if seq_len < 1:
+        return torch.tensor(0.0, device=device, requires_grad=True), {"bc_accuracy": 0.0}
+
+    # Convert to tensor if numpy array
+    if isinstance(observations, np.ndarray):
+        observations = torch.from_numpy(observations)
+    if isinstance(actions, np.ndarray):
+        actions = torch.from_numpy(actions)
+
+    # Get observation at t=0 for all trajectories
+    obs_t0 = observations[:, 0]  # (batch, *obs_shape)
+
+    # Get action at t=0 for all trajectories
+    action_t0 = actions[:, 0]  # (batch,)
+
+    # Move to device and normalize pixel observations from [0, 255] to [-1, 1]
+    obs_t0 = normalize_pixel_obs(obs_t0.to(device))
+    action_t0 = action_t0.long().to(device)
+
+    # Encode the observation
+    embedding_t0 = encoder(obs_t0)  # (batch, feature_dim)
+
+    # IMPORTANT: Detach embedding to prevent gradients from flowing back to encoder
+    if detach_encoder:
+        embedding_t0 = embedding_t0.detach()
+
+    # Get action prediction from BC head
+    logits = bc_head(embedding_t0)  # (batch, num_actions)
+
+    # Compute cross-entropy loss
+    loss = nn.functional.cross_entropy(logits, action_t0)
+
+    # Compute accuracy for logging
+    with torch.no_grad():
+        predictions = torch.argmax(logits, dim=-1)
+        accuracy = (predictions == action_t0).float().mean().item()
+
+    metrics = {
+        "bc_accuracy": accuracy,
     }
 
     return loss, metrics

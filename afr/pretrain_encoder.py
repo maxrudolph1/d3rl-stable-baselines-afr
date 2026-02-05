@@ -5,7 +5,7 @@ CARDPOL: Contrastive Actor Recognition for Diverse POLicies
 Main entry point for encoder pre-training using CARDPOL loss.
 
 Usage:
-    python -m afr_scripts.pretrain_encoder --data-config path/to/data_config.yaml
+    python -m afr.pretrain_encoder --data-config path/to/data_config.yaml
 
 The config YAML must contain:
     environment: name of the environment (e.g. "QbertNoFrameskip-v4")
@@ -25,11 +25,11 @@ import torch
 import d3rlpy
 from d3rlpy.preprocessing import PixelObservationScaler, ClipRewardScaler
 
-from afr_scripts.config import load_data_config
-from afr_scripts.extended_dataset import CombinedMDPDataset
-from afr_scripts.losses import cardpol_loss
-from afr_scripts.pretrainer import EncoderPretrainConfig, EncoderPretrainer
-from afr_scripts.utils import make_atari_env
+from afr.config import load_data_config
+from afr.extended_dataset import CombinedMDPDataset
+from afr.losses import cardpol_loss
+from afr.pretrainer import EncoderPretrainConfig, EncoderPretrainer
+from afr.utils import make_atari_env
 
 
 def main():

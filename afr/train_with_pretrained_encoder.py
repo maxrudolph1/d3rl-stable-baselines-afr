@@ -6,13 +6,13 @@ This script loads pre-trained encoder weights from CARDPOL pre-training
 and uses them to train a policy with CQL on a target dataset.
 
 Usage:
-    python -m afr_scripts.train_with_pretrained_encoder \
+    python -m afr.train_with_pretrained_encoder \
         --data-config path/to/data_config.yaml \
         --encoder-weights path/to/encoder_final.pt \
         --train-data path/to/training_data.pth
 
 Or use the data config for training data as well:
-    python -m afr_scripts.train_with_pretrained_encoder \
+    python -m afr.train_with_pretrained_encoder \
         --data-config path/to/data_config.yaml \
         --encoder-weights path/to/encoder_final.pt \
         --use-config-data
@@ -27,9 +27,9 @@ import d3rlpy
 from d3rlpy.preprocessing import PixelObservationScaler, ClipRewardScaler
 from d3rlpy.logging import FileAdapterFactory
 
-from afr_scripts.config import load_data_config
-from afr_scripts.pretrainer import load_pretrained_encoder_to_cql
-from afr_scripts.utils import make_atari_env
+from afr.config import load_data_config
+from afr.pretrainer import load_pretrained_encoder_to_cql
+from afr.utils import make_atari_env
 
 
 def load_dataset_from_path(data_path: str, env) -> d3rlpy.dataset.MDPDataset:
@@ -59,8 +59,8 @@ def main():
     parser.add_argument(
         "--encoder-weights",
         type=str,
-        required=True,
-        help="Path to pre-trained encoder weights (.pt file).",
+        default=None,
+        help="Path to pre-trained encoder weights (.pt file). If not provided, uses random weights.",
     )
     parser.add_argument(
         "--train-data",
@@ -179,8 +179,11 @@ def main():
     print("CQL model built.")
 
     # Load pre-trained encoder weights
-    print(f"\nLoading pre-trained encoder from: {args.encoder_weights}")
-    load_pretrained_encoder_to_cql(cql, args.encoder_weights, device=args.device)
+    if args.encoder_weights is not None:
+        print(f"\nLoading pre-trained encoder from: {args.encoder_weights}")
+        load_pretrained_encoder_to_cql(cql, args.encoder_weights, device=args.device)
+    else:
+        print("No pre-trained encoder weights provided, using random weights.")
 
     # Optionally freeze encoder weights
     if args.freeze_encoder:
