@@ -31,3 +31,4 @@ encoder_pretrain_qbert
 encoder_pretrain_logs
 artifacts
 cql_pretrained_logs
+slurm_jobs/

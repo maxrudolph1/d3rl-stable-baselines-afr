@@ -8,7 +8,7 @@ import torch.nn as nn
 
 from d3rlpy.dataset import TrajectoryMiniBatch
 
-from afr.classifier import CARDPOLClassifier, BehaviorCloningHead
+from afr.classifier import CARDPOLClassifier, BehaviorCloningHead, StateDecoderHead
 
 
 def normalize_pixel_obs(obs: torch.Tensor) -> torch.Tensor:
@@ -175,4 +175,75 @@ def bc_loss(
         "bc_accuracy": accuracy,
     }
 
+    return loss, metrics
+
+
+def state_decoder_loss(
+    encoder: nn.Module,
+    state_decoder: StateDecoderHead,
+    trajectory_batch: TrajectoryMiniBatch,
+    normalized_states: np.ndarray,
+    device: str = "cuda:0",
+    detach_encoder: bool = True,
+) -> tuple:
+    """
+    State decoder loss: predict normalized state from encoder representation.
+
+    For each observation in the trajectory batch, encode it, then decode the
+    representation to normalized state. Uses MSE loss. Only valid timesteps
+    (mask=1) are included in the loss.
+
+    IMPORTANT: By default, gradients do NOT backpropagate through the encoder.
+    The representation is detached before being passed to the state decoder.
+
+    Args:
+        encoder: The encoder network (gradients will NOT flow through if detach_encoder=True).
+        state_decoder: The StateDecoderHead to train.
+        trajectory_batch: Batch of trajectories (observations, masks).
+        normalized_states: Ground-truth normalized states, shape (B, L, state_dim).
+        device: Device to run on.
+        detach_encoder: If True, detach the representation so gradients do not
+                        flow back to the encoder. Defaults to True.
+
+    Returns:
+        Tuple of (loss, metrics_dict).
+    """
+    observations = trajectory_batch.observations  # (B, L, *obs_shape)
+    masks = trajectory_batch.masks  # (B, L)
+    batch_size, seq_len = observations.shape[:2]
+
+    if isinstance(observations, np.ndarray):
+        observations = torch.from_numpy(observations)
+    if isinstance(masks, np.ndarray):
+        masks = torch.from_numpy(masks)
+    if isinstance(normalized_states, np.ndarray):
+        normalized_states = torch.from_numpy(normalized_states)
+
+    # Flatten to (B*L, *obs_shape)
+    obs_flat = observations.reshape(-1, *observations.shape[2:])
+    masks_flat = masks.reshape(-1)  # (B*L,)
+    states_flat = normalized_states.reshape(-1, normalized_states.shape[-1]).to(device)  # (B*L, state_dim)
+
+    obs_flat = normalize_pixel_obs(obs_flat.to(device))
+    masks_flat = masks_flat.to(device)
+
+    # Encode all observations
+    embedding_flat = encoder(obs_flat)  # (B*L, embedding_size)
+    if detach_encoder:
+        embedding_flat = embedding_flat.detach()
+
+    # Decode to state
+    state_pred_flat = state_decoder(embedding_flat)  # (B*L, state_dim)
+
+    # MSE only on valid timesteps
+    diff = (state_pred_flat - states_flat) * masks_flat.unsqueeze(-1)
+    loss = (diff ** 2).sum() / (masks_flat.sum() * state_pred_flat.shape[-1] + 1e-8)
+
+    with torch.no_grad():
+        mae = (diff.abs().sum(dim=-1) / (state_pred_flat.shape[-1] + 1e-8)) * masks_flat
+        mae = mae.sum() / (masks_flat.sum() + 1e-8)
+
+    metrics = {
+        "state_decoder_mae": mae.item(),
+    }
     return loss, metrics

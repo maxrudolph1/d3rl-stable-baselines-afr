@@ -183,3 +183,58 @@ class BehaviorCloningHead(nn.Module):
         """Get action predictions."""
         logits = self.forward(embedding)
         return torch.argmax(logits, dim=-1)
+
+
+class StateDecoderHead(nn.Module):
+    """
+    State decoder head: predicts normalized state from encoder representation.
+
+    Takes a single embedding (e.g., from encoder) and predicts the d-dimensional
+    normalized state. Trained with MSE loss. Used when datasets include
+    "normalized_state" (e.g. RAM state that was normalized).
+
+    IMPORTANT: The embedding should be detached before being passed to this
+    head so that gradients do not backpropagate into the encoder.
+
+    Args:
+        embedding_size: Size of the embedding from the encoder.
+        state_dim: Dimension of the normalized state to predict.
+        hidden_sizes: List of hidden layer sizes. Defaults to [256, 128].
+    """
+
+    def __init__(
+        self,
+        embedding_size: int,
+        state_dim: int,
+        hidden_sizes: list = None,
+    ):
+        super().__init__()
+
+        if hidden_sizes is None:
+            hidden_sizes = [256, 128]
+
+        self.embedding_size = embedding_size
+        self.state_dim = state_dim
+
+        layers = []
+        in_size = embedding_size
+        for hidden_size in hidden_sizes:
+            layers.append(nn.Linear(in_size, hidden_size))
+            layers.append(nn.ReLU())
+            in_size = hidden_size
+
+        layers.append(nn.Linear(in_size, state_dim))
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, embedding: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+
+        Args:
+            embedding: Embedding from encoder, shape (batch_size, embedding_size).
+                      Should be detached to prevent gradient flow back to encoder.
+
+        Returns:
+            Predicted normalized state, shape (batch_size, state_dim).
+        """
+        return self.network(embedding)

@@ -76,7 +76,7 @@ def main():
     parser.add_argument(
         "--log-dir",
         type=str,
-        default="cql_pretrained_logs",
+        default="artifacts/offline_rl",
         help="Directory for logs and checkpoints.",
     )
     parser.add_argument(
@@ -88,7 +88,7 @@ def main():
     parser.add_argument(
         "--n-steps",
         type=int,
-        default=1000000,
+        default=10000000,
         help="Number of training steps.",
     )
     parser.add_argument(
@@ -105,13 +105,27 @@ def main():
     )
     parser.add_argument(
         "--freeze-encoder",
-        action="store_true",
+        type=bool,
+        default=False,
         help="Freeze encoder weights during training.",
     )
     parser.add_argument(
         "--no-eval",
         action="store_true",
         help="Disable environment evaluation during training.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=1,
+        help="Random seed for reproducibility.",
+    )
+    
+    parser.add_argument(
+        "--group",
+        type=str,
+        default=None,
+        help="Project name for logging.",
     )
     args = parser.parse_args()
 
@@ -166,6 +180,9 @@ def main():
 
     print(f"\nDataset: {len(dataset.episodes)} episodes")
 
+    d3rlpy.seed(args.seed)
+    d3rlpy.envs.seed_env(env, args.seed)
+
     # Create CQL model
     print("\nCreating CQL model...")
     cql = d3rlpy.algos.DiscreteCQLConfig(
@@ -179,7 +196,7 @@ def main():
     print("CQL model built.")
 
     # Load pre-trained encoder weights
-    if args.encoder_weights is not None:
+    if args.encoder_weights is not None and args.encoder_weights != 'null' and os.path.exists(args.encoder_weights) and args.encoder_weights != 'None':
         print(f"\nLoading pre-trained encoder from: {args.encoder_weights}")
         load_pretrained_encoder_to_cql(cql, args.encoder_weights, device=args.device)
     else:
@@ -197,8 +214,19 @@ def main():
         print("Encoder weights frozen.")
 
     # Set up logging
-    os.makedirs(args.log_dir, exist_ok=True)
-    logger_factory = FileAdapterFactory(args.log_dir)
+    from datetime import datetime
+    import random
+    import string
+    rand_tag = ''.join(random.choices(string.ascii_letters, k=4))
+    time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    unique_tag = f"{time_stamp}_{rand_tag}"
+    if args.group is not None:
+        log_dir = f"{args.log_dir}/{args.group}/{env_id}/"
+    else:
+        log_dir = f"{args.log_dir}/{env_id}/"
+        
+    os.makedirs(log_dir, exist_ok=True)
+    logger_factory = FileAdapterFactory(log_dir)
 
     # Set up evaluators
     evaluators = {}
@@ -209,14 +237,29 @@ def main():
         )
         print(f"Environment evaluation enabled (every {args.eval_interval} steps)")
 
+    import json
+    import yaml
+
+    config_to_save = {
+        "args": vars(args),
+        "unique_tag": unique_tag,
+    }
+    config_save_dir = os.path.join(log_dir, unique_tag)
+    os.makedirs(config_save_dir, exist_ok=True)
+    config_save_path = os.path.join(config_save_dir, "config.yaml")
+    with open(config_save_path, "w") as f:
+        yaml.dump(config_to_save, f)
+    print(f"Saved config and args to: {config_save_path}")
+    
     # Start training
     print("\n" + "=" * 50)
     print("Starting CQL training with pre-trained encoder...")
     print(f"  Steps: {args.n_steps}")
     print(f"  Save interval: {args.save_interval}")
-    print(f"  Log dir: {args.log_dir}")
+    print(f"  Log dir: {log_dir}")
     print(f"  Encoder frozen: {args.freeze_encoder}")
     print("=" * 50 + "\n")
+    
 
     cql.fit(
         dataset,
@@ -224,10 +267,15 @@ def main():
         save_interval=args.save_interval,
         evaluators=evaluators if evaluators else None,
         logger_adapter=logger_factory,
+        experiment_name=unique_tag,
+        with_timestamp=False,
     )
 
     # Save final model
     final_model_path = os.path.join(args.log_dir, "cql_final.d3")
+    # INSERT_YOUR_CODE
+
+    
     cql.save(final_model_path)
     print(f"\nFinal model saved to: {final_model_path}")
 

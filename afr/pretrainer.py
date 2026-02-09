@@ -23,9 +23,9 @@ except ImportError:
 
 import d3rlpy
 
-from afr.classifier import CARDPOLClassifier, BehaviorCloningHead
+from afr.classifier import CARDPOLClassifier, BehaviorCloningHead, StateDecoderHead
 from afr.extended_dataset import CombinedMDPDataset, TrajectoryBatchWithSource
-from afr.losses import cardpol_loss, bc_loss, normalize_pixel_obs
+from afr.losses import cardpol_loss, bc_loss, state_decoder_loss, normalize_pixel_obs
 
 
 @dataclass
@@ -50,6 +50,13 @@ class EncoderPretrainConfig:
     bc_hidden_sizes: list = None  # Default: [256, 128]
     bc_loss_weight: float = 1.0  # Weight for BC loss relative to CARDPOL loss
     num_actions: int = None  # Number of discrete actions (required if use_bc_head=True)
+
+    # State decoder head configuration (decodes normalized_state from representation; no grad through encoder)
+    use_state_decoder: bool = True  # Whether to train a state decoder when datasets have normalized_state
+    state_dim: int = None  # Dimension of normalized state (required if use_state_decoder=True)
+    state_decoder_learning_rate: float = 1e-3
+    state_decoder_hidden_sizes: list = None  # Default: [256, 128]
+    state_decoder_loss_weight: float = 1.0  # Weight for state decoder MSE loss
 
     # Logging
     log_interval: int = 100
@@ -78,8 +85,12 @@ class EncoderPretrainConfig:
             self.bc_hidden_sizes = [256, 128]
         if self.wandb_tags is None:
             self.wandb_tags = []
+        if self.state_decoder_hidden_sizes is None:
+            self.state_decoder_hidden_sizes = [256, 128]
         if self.use_bc_head and self.num_actions is None:
             raise ValueError("num_actions must be specified when use_bc_head=True")
+        if self.use_state_decoder and self.state_dim is None:
+            raise ValueError("state_dim must be specified when use_state_decoder=True")
 
 
 class EncoderPretrainer:
@@ -110,6 +121,7 @@ class EncoderPretrainer:
         loss_fn: Optional[Callable] = None,
         classifier: Optional[CARDPOLClassifier] = None,
         bc_head: Optional[BehaviorCloningHead] = None,
+        state_decoder: Optional[StateDecoderHead] = None,
         val_combined_dataset: Optional[CombinedMDPDataset] = None,
     ):
         """
@@ -124,6 +136,8 @@ class EncoderPretrainer:
                        If None, one will be created based on config.
             bc_head: Optional pre-initialized BehaviorCloningHead.
                     If None and config.use_bc_head=True, one will be created.
+            state_decoder: Optional pre-initialized StateDecoderHead.
+                    If None and config.use_state_decoder=True, one will be created.
             val_combined_dataset: Optional validation CombinedMDPDataset for
                                   evaluating classifier accuracy during training.
         """
@@ -166,6 +180,23 @@ class EncoderPretrainer:
             self.bc_optimizer = optim.Adam(
                 self.bc_head.parameters(),
                 lr=config.bc_learning_rate
+            )
+
+        # Create or use provided state decoder head (if enabled)
+        self.state_decoder = None
+        self.state_decoder_optimizer = None
+        if config.use_state_decoder:
+            if state_decoder is not None:
+                self.state_decoder = state_decoder.to(self.device)
+            else:
+                self.state_decoder = StateDecoderHead(
+                    embedding_size=encoder_feature_size,
+                    state_dim=config.state_dim,
+                    hidden_sizes=config.state_decoder_hidden_sizes,
+                ).to(self.device)
+            self.state_decoder_optimizer = optim.Adam(
+                self.state_decoder.parameters(),
+                lr=config.state_decoder_learning_rate,
             )
 
         # Set up optimizer for encoder parameters
@@ -212,6 +243,11 @@ class EncoderPretrainer:
                 "bc_hidden_sizes": config.bc_hidden_sizes,
                 "bc_loss_weight": config.bc_loss_weight,
                 "num_actions": config.num_actions,
+                # State decoder config
+                "use_state_decoder": config.use_state_decoder,
+                "state_dim": config.state_dim,
+                "state_decoder_learning_rate": config.state_decoder_learning_rate,
+                "state_decoder_loss_weight": config.state_decoder_loss_weight,
             }
             wandb.init(
                 project=config.wandb_project,
@@ -225,6 +261,8 @@ class EncoderPretrainer:
             wandb.watch(self.classifier, log="gradients", log_freq=config.log_interval)
             if self.bc_head is not None:
                 wandb.watch(self.bc_head, log="gradients", log_freq=config.log_interval)
+            if self.state_decoder is not None:
+                wandb.watch(self.state_decoder, log="gradients", log_freq=config.log_interval)
 
     def _compute_encoder_feature_size(self) -> int:
         """Compute the output feature size of the encoder."""
@@ -285,6 +323,8 @@ class EncoderPretrainer:
         self.classifier.train()
         if self.bc_head is not None:
             self.bc_head.train()
+        if self.state_decoder is not None:
+            self.state_decoder.train()
 
         # Use the first encoder for the loss (they share the same architecture)
         cardpol_loss_val, metrics = self.loss_fn(
@@ -338,10 +378,28 @@ class EncoderPretrainer:
             all_metrics["bc_loss"] = bc_loss_val.item()
             all_metrics.update(bc_metrics)
 
+        # State decoder loss: decode normalized_state from representation (no grad through encoder)
+        if self.state_decoder is not None and batch_with_source.normalized_states is not None:
+            state_decoder_loss_val, state_decoder_metrics = state_decoder_loss(
+                encoder=self.encoders[0],
+                state_decoder=self.state_decoder,
+                trajectory_batch=trajectory_batch,
+                normalized_states=batch_with_source.normalized_states,
+                device=self.device,
+                detach_encoder=True,
+            )
+            self.state_decoder_optimizer.zero_grad()
+            state_decoder_loss_val.backward()
+            self.state_decoder_optimizer.step()
+            all_metrics["state_decoder_loss"] = state_decoder_loss_val.item()
+            all_metrics.update(state_decoder_metrics)
+
         # Compute total loss for logging (weighted sum)
         total_loss = cardpol_loss_val.item()
         if self.bc_head is not None:
             total_loss += self.config.bc_loss_weight * bc_loss_val.item()
+        if self.state_decoder is not None and "state_decoder_loss" in all_metrics:
+            total_loss += self.config.state_decoder_loss_weight * all_metrics["state_decoder_loss"]
         all_metrics["loss"] = total_loss
 
         return all_metrics
@@ -363,6 +421,8 @@ class EncoderPretrainer:
         self.classifier.eval()
         if self.bc_head is not None:
             self.bc_head.eval()
+        if self.state_decoder is not None:
+            self.state_decoder.eval()
 
         total_loss = 0.0
         total_correct = 0
@@ -374,6 +434,10 @@ class EncoderPretrainer:
         bc_total_loss = 0.0
         bc_total_correct = 0
         bc_total_samples = 0
+
+        # State decoder validation metrics
+        state_decoder_total_mae = 0.0
+        state_decoder_n_batches = 0
 
         for _ in range(self.config.val_n_batches):
             # Sample validation batch
@@ -437,12 +501,30 @@ class EncoderPretrainer:
                 bc_total_correct += (bc_predictions == action_t0).sum().item()
                 bc_total_samples += batch_size
 
+            # State decoder validation when batch has normalized_states
+            if (
+                self.state_decoder is not None
+                and batch_with_source.normalized_states is not None
+            ):
+                _, state_decoder_metrics = state_decoder_loss(
+                    encoder=self.encoders[0],
+                    state_decoder=self.state_decoder,
+                    trajectory_batch=trajectory_batch,
+                    normalized_states=batch_with_source.normalized_states,
+                    device=self.device,
+                    detach_encoder=True,
+                )
+                state_decoder_total_mae += state_decoder_metrics["state_decoder_mae"]
+                state_decoder_n_batches += 1
+
         # Set models back to train mode
         for encoder in self.encoders:
             encoder.train()
         self.classifier.train()
         if self.bc_head is not None:
             self.bc_head.train()
+        if self.state_decoder is not None:
+            self.state_decoder.train()
 
         if total_samples == 0:
             return {"val_accuracy": 0.0, "val_loss": 0.0}
@@ -467,6 +549,12 @@ class EncoderPretrainer:
             val_metrics["val_bc_accuracy"] = bc_total_correct / bc_total_samples
             val_metrics["val_bc_loss"] = bc_total_loss / bc_total_samples
 
+        # Add state decoder validation metrics
+        if self.state_decoder is not None and state_decoder_n_batches > 0:
+            val_metrics["val_state_decoder_mae"] = (
+                state_decoder_total_mae / state_decoder_n_batches
+            )
+
         return val_metrics
 
     def pretrain(self) -> None:
@@ -485,6 +573,9 @@ class EncoderPretrainer:
         if self.bc_head is not None:
             print(f"BC head enabled: {self.config.num_actions} actions, weight={self.config.bc_loss_weight}")
             print(f"  NOTE: BC gradients do NOT backpropagate to encoder")
+        if self.state_decoder is not None:
+            print(f"State decoder enabled: state_dim={self.config.state_dim}, weight={self.config.state_decoder_loss_weight}")
+            print(f"  NOTE: State decoder gradients do NOT backpropagate to encoder")
         print("-" * 50)
 
         best_val_accuracy = 0.0
@@ -568,14 +659,16 @@ class EncoderPretrainer:
         path: str,
         include_classifier: bool = True,
         include_bc_head: bool = True,
+        include_state_decoder: bool = True,
     ) -> None:
         """
-        Save encoder, classifier, and BC head weights to a file.
+        Save encoder, classifier, BC head, and state decoder weights to a file.
 
         Args:
             path: Path to save the weights.
             include_classifier: Whether to include classifier weights.
             include_bc_head: Whether to include BC head weights.
+            include_state_decoder: Whether to include state decoder weights.
         """
         state_dict = {}
         for i, encoder in enumerate(self.encoders):
@@ -596,6 +689,13 @@ class EncoderPretrainer:
                 "num_actions": self.bc_head.num_actions,
             }
 
+        if include_state_decoder and self.state_decoder is not None:
+            state_dict["state_decoder"] = self.state_decoder.state_dict()
+            state_dict["state_decoder_config"] = {
+                "embedding_size": self.state_decoder.embedding_size,
+                "state_dim": self.state_decoder.state_dim,
+            }
+
         torch.save(state_dict, path)
         print(f"Saved encoder weights to {path}")
 
@@ -604,14 +704,16 @@ class EncoderPretrainer:
         path: str,
         load_classifier: bool = True,
         load_bc_head: bool = True,
+        load_state_decoder: bool = True,
     ) -> None:
         """
-        Load encoder, classifier, and BC head weights from a file.
+        Load encoder, classifier, BC head, and state decoder weights from a file.
 
         Args:
             path: Path to load the weights from.
             load_classifier: Whether to load classifier weights.
             load_bc_head: Whether to load BC head weights.
+            load_state_decoder: Whether to load state decoder weights.
         """
         state_dict = torch.load(path, map_location=self.device)
         for i, encoder in enumerate(self.encoders):
@@ -626,6 +728,10 @@ class EncoderPretrainer:
         if load_bc_head and "bc_head" in state_dict and self.bc_head is not None:
             self.bc_head.load_state_dict(state_dict["bc_head"])
             loaded_components.append("bc_head")
+
+        if load_state_decoder and "state_decoder" in state_dict and self.state_decoder is not None:
+            self.state_decoder.load_state_dict(state_dict["state_decoder"])
+            loaded_components.append("state_decoder")
 
         print(f"Loaded {', '.join(loaded_components)} weights from {path}")
 

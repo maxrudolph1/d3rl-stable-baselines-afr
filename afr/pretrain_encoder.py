@@ -45,7 +45,7 @@ def main():
     parser.add_argument(
         "--log-dir",
         type=str,
-        default="encoder_pretrain_logs",
+        default="artifacts",
         help="Directory for logs and checkpoints.",
     )
     parser.add_argument(
