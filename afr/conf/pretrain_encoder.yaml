@@ -1,0 +1,36 @@
+# Hydra config for CARDPOL encoder pre-training.
+# Override from CLI: python -m afr.pretrain_encoder data_config=afr/data_configs/breakout.yaml n_steps=5000
+# Or override data config path: python -m afr.pretrain_encoder data_config=path/to/data.yaml
+
+defaults: []
+
+hydra:
+  job:
+    chdir: false  # keep cwd so relative paths (data_config, data paths in YAML) work
+
+# Path to data config YAML (environment, data, validation_data). Required override.
+data_config: ???
+
+# Run / logging
+log_dir: artifacts
+device: cuda:0
+n_steps: 10000
+batch_size: 512
+no_wandb: false
+group: default
+
+# Encoder pretrain settings (passed to EncoderPretrainer as OmegaConf)
+pretrain:
+  learning_rate: 1.0e-4
+  classifier_learning_rate: 1.0e-4
+  trajectory_length: 10
+  classifier_hidden_sizes: [256, 128]
+  classifier_combine_mode: concat
+  log_interval: 100
+  save_interval: 2000
+  val_interval: 500
+  val_batch_size: 64
+  val_n_batches: 10
+  use_bc_head: false
+  use_state_decoder: false
+  # num_sources, num_actions, log_dir, device, group, use_wandb, wandb_* are set at runtime from top-level cfg

@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
+from afr.config import EncoderPretrainConfig
 
 try:
     import wandb
@@ -26,72 +27,6 @@ import d3rlpy
 from afr.classifier import CARDPOLClassifier, BehaviorCloningHead, StateDecoderHead
 from afr.extended_dataset import CombinedMDPDataset, TrajectoryBatchWithSource
 from afr.losses import cardpol_loss, bc_loss, state_decoder_loss, normalize_pixel_obs
-
-
-@dataclass
-class EncoderPretrainConfig:
-    """Configuration for encoder pre-training."""
-
-    # Training
-    learning_rate: float = 1e-3
-    classifier_learning_rate: float = 1e-3
-    batch_size: int = 512
-    trajectory_length: int = 10
-    n_steps: int = 100000
-
-    # Classifier configuration
-    num_sources: int = 2
-    classifier_hidden_sizes: list = None  # Default: [256, 128]
-    classifier_combine_mode: str = "concat"  # 'concat', 'diff', or 'concat_diff'
-
-    # Behavior Cloning head configuration
-    use_bc_head: bool = True  # Whether to train a BC head alongside CARDPOL
-    bc_learning_rate: float = 1e-3
-    bc_hidden_sizes: list = None  # Default: [256, 128]
-    bc_loss_weight: float = 1.0  # Weight for BC loss relative to CARDPOL loss
-    num_actions: int = 4  # Number of discrete actions (required if use_bc_head=True)
-
-    # State decoder head configuration (decodes normalized_state from representation; no grad through encoder)
-    use_state_decoder: bool = False  # Whether to train a state decoder when datasets have normalized_state
-    state_dim: int = None  # Dimension of normalized state (required if use_state_decoder=True)
-    state_decoder_learning_rate: float = 1e-3
-    state_decoder_hidden_sizes: list = None  # Default: [256, 128]
-    state_decoder_loss_weight: float = 1.0  # Weight for state decoder MSE loss
-
-    # Logging
-    log_interval: int = 100
-    save_interval: int = 10000
-    log_dir: str = "encoder_pretrain_logs"
-    group: str = "default"
-
-    # Wandb logging
-    use_wandb: bool = False
-    wandb_project: str = "encoder_pretrain"
-    wandb_entity: str = None  # None uses default entity
-    wandb_run_name: str = None  # None auto-generates name
-    wandb_tags: list = None  # Optional tags for the run
-
-    # Validation
-    val_interval: int = 500  # How often to run validation (0 to disable)
-    val_batch_size: int = 64  # Batch size for validation
-    val_n_batches: int = 10  # Number of batches to use for validation
-
-    # Device
-    device: str = "cuda:0"
-
-    def __post_init__(self):
-        if self.classifier_hidden_sizes is None:
-            self.classifier_hidden_sizes = [256, 128]
-        if self.bc_hidden_sizes is None:
-            self.bc_hidden_sizes = [256, 128]
-        if self.wandb_tags is None:
-            self.wandb_tags = []
-        if self.state_decoder_hidden_sizes is None:
-            self.state_decoder_hidden_sizes = [256, 128]
-        if self.use_bc_head and self.num_actions is None:
-            raise ValueError("num_actions must be specified when use_bc_head=True")
-        if self.use_state_decoder and self.state_dim is None:
-            raise ValueError("state_dim must be specified when use_state_decoder=True")
 
 
 class EncoderPretrainer:
@@ -315,6 +250,7 @@ class EncoderPretrainer:
             batch_size=self.config.batch_size,
             length=self.config.trajectory_length,
         )
+        import pdb; pdb.set_trace()
         trajectory_batch, source_ids = self._prepare_trajectory_batch(batch_with_source)
 
         # Compute loss for each encoder
@@ -495,7 +431,7 @@ class EncoderPretrainer:
 
             # Compute BC validation metrics if BC head is enabled
             if self.bc_head is not None:
-                action_t0 = actions[:, 0].long().to(self.device)
+                action_t0 = actions[:, 0, 0].long().to(self.device)
                 bc_logits = self.bc_head(embedding_t0.detach())
                 bc_loss_val = nn.functional.cross_entropy(bc_logits, action_t0)
                 bc_total_loss += bc_loss_val.item() * batch_size

@@ -15,7 +15,7 @@ The config YAML must contain:
 See pretrain_data_config_example.yaml for an example config.
 """
 
-import argparse
+from omegaconf import OmegaConf
 import os
 import sys
 from datetime import datetime
@@ -25,7 +25,7 @@ import torch
 import d3rlpy
 from d3rlpy.preprocessing import PixelObservationScaler, ClipRewardScaler
 
-from afr.config import load_data_config
+from afr.config import load_data_config, EncoderPretrainConfig
 from afr.extended_dataset import CombinedMDPDataset
 from afr.losses import cardpol_loss
 from afr.pretrainer import EncoderPretrainConfig, EncoderPretrainer
@@ -33,55 +33,61 @@ from afr.utils import make_atari_env
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="CARDPOL encoder pre-training. Pass a data config YAML with --data-config."
-    )
-    parser.add_argument(
-        "--data-config",
-        type=str,
-        required=True,
-        help="Path to YAML config with keys: environment, data (list of path/label), validation_data.",
-    )
-    parser.add_argument(
-        "--log-dir",
-        type=str,
-        default="artifacts",
-        help="Directory for logs and checkpoints.",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda:0",
-        help="Device to use for training.",
-    )
-    parser.add_argument(
-        "--n-steps",
-        type=int,
-        default=10000,
-        help="Number of pre-training steps.",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=512,
-        help="Batch size for training.",
-    )
-    parser.add_argument(
-        "--no-wandb",
-        action="store_true",
-        help="Disable wandb logging.",
-    )
+    # parser = argparse.ArgumentParser(
+    #     description="CARDPOL encoder pre-training. Pass a data config YAML with --data-config."
+    # )
+    # parser.add_argument(
+    #     "--data-config",
+    #     type=str,
+    #     required=True,
+    #     help="Path to YAML config with keys: environment, data (list of path/label), validation_data.",
+    # )
+    # parser.add_argument(
+    #     "--log-dir",
+    #     type=str,
+    #     default="artifacts",
+    #     help="Directory for logs and checkpoints.",
+    # )
+    # parser.add_argument(
+    #     "--device",
+    #     type=str,
+    #     default="cuda:0",
+    #     help="Device to use for training.",
+    # )
+    # parser.add_argument(
+    #     "--n-steps",
+    #     type=int,
+    #     default=10000,
+    #     help="Number of pre-training steps.",
+    # )
+    # parser.add_argument(
+    #     "--batch-size",
+    #     type=int,
+    #     default=512,
+    #     help="Batch size for training.",
+    # )
+    # parser.add_argument(
+    #     "--no-wandb",
+    #     action="store_true",
+    #     help="Disable wandb logging.",
+    # )
     
-    parser.add_argument(
-        "--group",
-        type=str,
-        default="default",
-        help="Group name for logging.",
-    )
-    args = parser.parse_args()
+    # parser.add_argument(
+    #     "--group",
+    #     type=str,
+    #     default="default",
+    #     help="Group name for logging.",
+    # )
+    # args = parser.parse_args()
+    
+    args = OmegaConf.from_cli()
+    data_config_path = args.data_config
+    del args.data_config
+    args = EncoderPretrainConfig(**args)
+    print(args)
 
     # Load data config
-    data_config = load_data_config(args.data_config)
+    data_config = load_data_config(data_config_path)
     data_paths = data_config.data_paths
     val_data_paths = data_config.validation_data_paths
     labels = [str(l) for l in data_config.data_labels]
@@ -182,7 +188,7 @@ def main():
         val_batch_size=64,
         val_n_batches=10,
         # Wandb settings
-        use_wandb=not args.no_wandb,
+        use_wandb=args.use_wandb,
         wandb_project="cardpol_atari_pretrain",
         wandb_run_name=f"cardpol_{args.group}_{env_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         wandb_tags=["cardpol", "encoder_pretrain", env_id],

@@ -147,7 +147,7 @@ def bc_loss(
     obs_t0 = observations[:, 0]  # (batch, *obs_shape)
 
     # Get action at t=0 for all trajectories
-    action_t0 = actions[:, 0]  # (batch,)
+    action_t0 = actions[:, 0, 0]  # (batch, horizon, 1) -> (batch,)
 
     # Move to device and normalize pixel observations from [0, 255] to [-1, 1]
     obs_t0 = normalize_pixel_obs(obs_t0.to(device))

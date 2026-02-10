@@ -1,19 +1,14 @@
 """
 Data configuration for CARDPOL encoder pre-training.
 
-Provides YAML-based configuration loading for specifying data paths,
-validation paths, labels, and environment name.
+Loads YAML with OmegaConf (environment, data paths, validation_data).
 """
 
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple, Union
 
-try:
-    import yaml
-    YAML_AVAILABLE = True
-except ImportError:
-    YAML_AVAILABLE = False
+from omegaconf import OmegaConf
 
 
 @dataclass
@@ -33,6 +28,72 @@ class DataConfig:
     data_labels: List[Union[int, str]]
     validation_data_paths: List[str]
     validation_data_labels: List[Union[int, str]]
+    
+    
+@dataclass
+class EncoderPretrainConfig:
+    """Configuration for encoder pre-training."""
+
+    # Training
+    learning_rate: float = 1e-3
+    classifier_learning_rate: float = 1e-3
+    batch_size: int = 512
+    trajectory_length: int = 10
+    n_steps: int = 100000
+
+    # Classifier configuration
+    num_sources: int = 2
+    classifier_hidden_sizes: list = None  # Default: [256, 128]
+    classifier_combine_mode: str = "concat"  # 'concat', 'diff', or 'concat_diff'
+
+    # Behavior Cloning head configuration
+    use_bc_head: bool = True  # Whether to train a BC head alongside CARDPOL
+    bc_learning_rate: float = 1e-3
+    bc_hidden_sizes: list = None  # Default: [256, 128]
+    bc_loss_weight: float = 1.0  # Weight for BC loss relative to CARDPOL loss
+    num_actions: int = 4  # Number of discrete actions (required if use_bc_head=True)
+
+    # State decoder head configuration (decodes normalized_state from representation; no grad through encoder)
+    use_state_decoder: bool = False  # Whether to train a state decoder when datasets have normalized_state
+    state_dim: int = None  # Dimension of normalize[d state (required if use_state_decoder=True)
+    state_decoder_learning_rate: float = 1e-3
+    state_decoder_hidden_sizes: list = None  # Default: [256, 128]
+    state_decoder_loss_weight: float = 1.0  # Weight for state decoder MSE loss
+
+    # Logging
+    log_interval: int = 100
+    save_interval: int = 10000
+    log_dir: str = "encoder_pretrain_logs"
+    group: str = "default"
+
+    # Wandb logging
+    use_wandb: bool = True
+    wandb_project: str = "encoder_pretrain"
+    wandb_entity: str = None  # None uses default entity
+    wandb_run_name: str = None  # None auto-generates name
+    wandb_tags: list = None  # Optional tags for the run
+
+    # Validation
+    val_interval: int = 500  # How often to run validation (0 to disable)
+    val_batch_size: int = 64  # Batch size for validation
+    val_n_batches: int = 10  # Number of batches to use for validation
+
+    # Device
+    device: str = "cuda:0"
+
+    def __post_init__(self):
+        if self.classifier_hidden_sizes is None:
+            self.classifier_hidden_sizes = [256, 128]
+        if self.bc_hidden_sizes is None:
+            self.bc_hidden_sizes = [256, 128]
+        if self.wandb_tags is None:
+            self.wandb_tags = []
+        if self.state_decoder_hidden_sizes is None:
+            self.state_decoder_hidden_sizes = [256, 128]
+        if self.use_bc_head and self.num_actions is None:
+            raise ValueError("num_actions must be specified when use_bc_head=True")
+        if self.use_state_decoder and self.state_dim is None:
+            raise ValueError("state_dim must be specified when use_state_decoder=True")
 
 
 def load_data_config(config_path: Union[str, Path]) -> DataConfig:
@@ -63,23 +124,16 @@ def load_data_config(config_path: Union[str, Path]) -> DataConfig:
         DataConfig with parsed data paths, labels, and environment.
 
     Raises:
-        RuntimeError: If PyYAML is not installed.
         FileNotFoundError: If the config file does not exist.
         ValueError: If the config file is malformed.
     """
-    if not YAML_AVAILABLE:
-        raise RuntimeError(
-            "Loading config from YAML requires PyYAML. Install with: pip install pyyaml"
-        )
     config_path = Path(config_path)
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
-    with open(config_path) as f:
-        raw = yaml.safe_load(f)
-        
+    raw = OmegaConf.to_container(OmegaConf.load(config_path), resolve=True)
     if not isinstance(raw, dict):
-        raise ValueError("Config YAML must be a mapping (dict).")
+        raise ValueError("Config must be a mapping (dict).")
 
     environment = raw.get("environment")
     if environment is None:

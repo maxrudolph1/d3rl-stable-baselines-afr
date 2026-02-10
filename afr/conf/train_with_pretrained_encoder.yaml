@@ -1,0 +1,27 @@
+# Hydra config for CQL training with pre-trained encoder.
+# Override from CLI: python -m afr.train_with_pretrained_encoder data_config=afr/data_configs/breakout_post.yaml encoder_weights=path/to/encoder_final.pt
+
+defaults: []
+
+hydra:
+  job:
+    chdir: false  # keep cwd so relative paths work
+
+# Path to data config YAML (for environment name and optional data paths). Required override.
+data_config: ???
+
+# Encoder and data
+encoder_weights: null
+train_data: null
+use_config_data: false
+
+# Run
+log_dir: artifacts/offline_rl
+device: cuda:0
+n_steps: 10000000
+save_interval: 10000
+eval_interval: 10000
+freeze_encoder: false
+no_eval: false
+seed: 1
+group: null

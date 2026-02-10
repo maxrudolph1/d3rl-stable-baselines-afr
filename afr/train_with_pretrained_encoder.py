@@ -237,19 +237,16 @@ def main():
         )
         print(f"Environment evaluation enabled (every {args.eval_interval} steps)")
 
-    import json
-    import yaml
+    from omegaconf import OmegaConf
 
-    config_to_save = {
-        "args": vars(args),
-        "unique_tag": unique_tag,
-    }
     config_save_dir = os.path.join(log_dir, unique_tag)
     os.makedirs(config_save_dir, exist_ok=True)
     config_save_path = os.path.join(config_save_dir, "config.yaml")
-    with open(config_save_path, "w") as f:
-        yaml.dump(config_to_save, f)
-    print(f"Saved config and args to: {config_save_path}")
+    OmegaConf.save(
+        OmegaConf.create({"args": vars(args), "unique_tag": unique_tag}),
+        config_save_path,
+    )
+    print(f"Saved config to: {config_save_path}")
     
     # Start training
     print("\n" + "=" * 50)
