@@ -1,0 +1,21 @@
+# Example data config for CARDPOL encoder pre-training.
+# Pass with: python -m afr.pretrain_encoder --config afr/pretrain_data_config_example.yaml
+#
+# Required:
+#   environment: name of the environment (e.g. for Atari or Gym)
+#   data: list of training data entries (path required, label optional)
+#   validation_data: list of validation data entries (optional; can be empty)
+#
+# Each entry under data and validation_data can be:
+#   - A dict with "path" and optional "label" (defaults to index 0, 1, 2, ...)
+#   - A string (path only; label defaults to index)
+
+environment: "PongNoFrameskip-v4"
+
+data:
+  - path: "atari_data/PongNoFrameskip-v4/dqn/ckpt_3_100000.pth"
+    label: 0
+
+validation_data:
+  - path: "atari_data/PongNoFrameskip-v4/dqn/ckpt_3_10000.pth"
+    label: 0

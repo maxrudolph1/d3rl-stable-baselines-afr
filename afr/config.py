@@ -77,7 +77,7 @@ def load_data_config(config_path: Union[str, Path]) -> DataConfig:
 
     with open(config_path) as f:
         raw = yaml.safe_load(f)
-
+        
     if not isinstance(raw, dict):
         raise ValueError("Config YAML must be a mapping (dict).")
 

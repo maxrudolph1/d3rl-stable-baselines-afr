@@ -77,9 +77,10 @@ echo "Running on node: $(hostname)"
             with open(f"slurm_jobs/{config[group_key]}/job_{jid}/submission.sh", "w") as f:
                 f.write(SLURM_SCRIPT)
         else:
-            print('DRY RUN:')
-            print(f'python {script} {cli_args}')
-            print('--------------------------------')
+            print('########  DRY RUN  ##########')
+            print(f'{script} {cli_args}')
+            print('#############################')
+            print()
 
 
 if __name__ == "__main__":
@@ -90,74 +91,32 @@ if __name__ == "__main__":
 
 
     ########################## TRAIN SETTINGS #################################
-    # data_configs = [
-    #     'configs/data/mll/cheetah_clean.yaml'
-    # ]
-    # exp_name = 'cheetah_clean'
-    # group = 'CLEAN_CHEETAH_EXPERT_01_28_2026'
-    # script = 'main.py'
-    # # sweep_configs = [
-    # #     {
-    # #         'config': 'configs/acroaf.yaml',
-    # #         'data_config': data_configs,
-    # #         'seed': 0,
-    # #         'model.K': 10,
-    # #         'exp_name': exp_name,
-    # #         'project_name': 'cardpol',
-    # #         'group': group,
-    # #         'train.epochs': 4,
-    # #         'env.domain': 'cheetah',
-    # #     },
-    # sweep_configs = [
-    #     {
-    #         'config': 'configs/vip.yaml',
-    #         'data_config': data_configs,
-    #         'seed': 0,
-    #         'exp_name': exp_name,
-    #         'project_name': 'cardpol',
-    #         'group': group,
-    #         'train.epochs': 4,
-    #         'env.domain': 'cheetah',
-    #     },
-    #     {
-    #         'config': 'configs/ae.yaml',
-    #         'data_config': data_configs,
-    #         'seed': 0,
-    #         'exp_name': exp_name,
-    #         'project_name': 'cardpol',
-    #         'group': group,
-    #         'train.epochs': 4,
-    #         'env.domain': 'cheetah',
-    #     },
-    #     {
-    #         'config': 'configs/curl.yaml',
-    #         'data_config': data_configs,
-    #         'seed': 0,
-    #         'exp_name': exp_name,
-    #         'project_name': 'cardpol',
-    #         'group': group,
-    #         'train.epochs': 4,
-    #         'env.domain': 'cheetah',
-    #     },
-    # ]
+    script = 'python -m afr.pretrain_encoder'
+    sweep_configs = [
+        {
+            '--data-config' : 'afr/data_configs/breakout_random-expert.yaml',
+            '--log-dir' : 'artifacts',
+            '--group' : 'BREAKOUT_RANDOM_EXPERT_02_10_2026',
+        }
+    ]
 
     ########################## EVAL SETTINGS #################################
 
-    script = 'python -m afr.train_with_pretrained_encoder'
+    # script = 'python -m afr.train_with_pretrained_encoder'
     
-    # weights = ['artifacts/BreakoutNoFrameskip-v4/20260204_223530/encoder_final.pt', 'null']
-    weights = ['artifacts/BreakoutNoFrameskip-v4/20260204_223530/encoder_final.pt']
-    seeds = [0, 1, 2, 3, 4]
-    freeze_encoders = [False]
-    sweep_configs = [
-        {
-            '--data-config' : 'afr/data_configs/breakout_post.yaml',
-            '--log-dir' : 'artifacts/offline_rl',
-            '--seed' : seeds,
-            # '--encoder-weights' : weights,
-            '--group' : 'BREAKOUT_POST_EXPERT_02_04_2026',   
-            '--eval-interval': 500000,
-        }
-    ]
+    # # weights = ['artifacts/BreakoutNoFrameskip-v4/20260204_223530/encoder_final.pt', 'null']
+    # weights = ['artifacts/BreakoutNoFrameskip-v4/20260204_223530/encoder_final.pt']
+    # seeds = [0, 1, 2, 3, 4]
+    # freeze_encoders = [False]
+    # sweep_configs = [
+    #     {
+    #         '--data-config' : 'afr/data_configs/breakout_post.yaml',
+    #         '--log-dir' : 'artifacts/offline_rl',
+    #         '--seed' : seeds,
+    #         # '--encoder-weights' : weights,
+    #         '--group' : 'BREAKOUT_POST_EXPERT_02_04_2026',   
+    #         '--eval-interval': 500000,
+    #     }
+    # ]
         
     main(args.dry_run, sweep_configs, script)

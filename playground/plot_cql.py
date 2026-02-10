@@ -191,7 +191,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "root_dir",
         type=str,
-        default="/u/mrudolph/documents/d3rlpy/artifacts/offline_rl/SEAQUEST_POST_EXPERT_02_07_2026",
+        default="/u/mrudolph/documents/d3rlpy/artifacts/offline_rl/BREAKOUT_POST_EXPERT_02_04_2026",
         nargs="?",
         help="Root directory containing <game>/<run_name>/ with environment.csv and config.yaml",
     )

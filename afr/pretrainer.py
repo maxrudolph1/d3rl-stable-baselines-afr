@@ -35,7 +35,7 @@ class EncoderPretrainConfig:
     # Training
     learning_rate: float = 1e-3
     classifier_learning_rate: float = 1e-3
-    batch_size: int = 32
+    batch_size: int = 512
     trajectory_length: int = 10
     n_steps: int = 100000
 
@@ -45,14 +45,14 @@ class EncoderPretrainConfig:
     classifier_combine_mode: str = "concat"  # 'concat', 'diff', or 'concat_diff'
 
     # Behavior Cloning head configuration
-    use_bc_head: bool = False  # Whether to train a BC head alongside CARDPOL
+    use_bc_head: bool = True  # Whether to train a BC head alongside CARDPOL
     bc_learning_rate: float = 1e-3
     bc_hidden_sizes: list = None  # Default: [256, 128]
     bc_loss_weight: float = 1.0  # Weight for BC loss relative to CARDPOL loss
-    num_actions: int = None  # Number of discrete actions (required if use_bc_head=True)
+    num_actions: int = 4  # Number of discrete actions (required if use_bc_head=True)
 
     # State decoder head configuration (decodes normalized_state from representation; no grad through encoder)
-    use_state_decoder: bool = True  # Whether to train a state decoder when datasets have normalized_state
+    use_state_decoder: bool = False  # Whether to train a state decoder when datasets have normalized_state
     state_dim: int = None  # Dimension of normalized state (required if use_state_decoder=True)
     state_decoder_learning_rate: float = 1e-3
     state_decoder_hidden_sizes: list = None  # Default: [256, 128]
@@ -62,6 +62,7 @@ class EncoderPretrainConfig:
     log_interval: int = 100
     save_interval: int = 10000
     log_dir: str = "encoder_pretrain_logs"
+    group: str = "default"
 
     # Wandb logging
     use_wandb: bool = False
@@ -215,7 +216,7 @@ class EncoderPretrainer:
         self.loss_fn = loss_fn or cardpol_loss
 
         # Logging
-        self.writer = SummaryWriter(config.log_dir)
+        self.writer = SummaryWriter(f"{config.log_dir}/{config.group}")
 
         # Initialize wandb if enabled
         self.use_wandb = config.use_wandb and WANDB_AVAILABLE
@@ -248,6 +249,7 @@ class EncoderPretrainer:
                 "state_dim": config.state_dim,
                 "state_decoder_learning_rate": config.state_decoder_learning_rate,
                 "state_decoder_loss_weight": config.state_decoder_loss_weight,
+                "group": config.group,
             }
             wandb.init(
                 project=config.wandb_project,

@@ -71,6 +71,13 @@ def main():
         action="store_true",
         help="Disable wandb logging.",
     )
+    
+    parser.add_argument(
+        "--group",
+        type=str,
+        default="default",
+        help="Group name for logging.",
+    )
     args = parser.parse_args()
 
     # Load data config
@@ -151,7 +158,7 @@ def main():
     
     # Save the model
     time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_dir = f"{args.log_dir}/{env_id}/{time_stamp}/"
+    log_dir = f"{args.log_dir}/{args.group}/{env_id}/{time_stamp}/"
     os.makedirs(log_dir, exist_ok=True)
     # cql.save(log_dir)
     print(f"Model saved to {log_dir}")
@@ -177,7 +184,7 @@ def main():
         # Wandb settings
         use_wandb=not args.no_wandb,
         wandb_project="cardpol_atari_pretrain",
-        wandb_run_name=f"cardpol_{env_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        wandb_run_name=f"cardpol_{args.group}_{env_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         wandb_tags=["cardpol", "encoder_pretrain", env_id],
     )
 
