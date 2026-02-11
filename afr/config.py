@@ -60,6 +60,12 @@ class EncoderPretrainConfig:
     state_decoder_hidden_sizes: list = None  # Default: [256, 128]
     state_decoder_loss_weight: float = 1.0  # Weight for state decoder MSE loss
 
+    # State classifier configuration (predicts source_id from normalized_state; no encoder)
+    use_state_classifier: bool = False  # Whether to train a state classifier when batches have normalized_states
+    state_classifier_learning_rate: float = 1e-3
+    state_classifier_hidden_sizes: list = None  # Default: [256, 128]
+    state_classifier_loss_weight: float = 1.0  # Weight for state classifier cross-entropy loss
+
     # Logging
     log_interval: int = 100
     save_interval: int = 10000
@@ -90,10 +96,14 @@ class EncoderPretrainConfig:
             self.wandb_tags = []
         if self.state_decoder_hidden_sizes is None:
             self.state_decoder_hidden_sizes = [256, 128]
+        if self.state_classifier_hidden_sizes is None:
+            self.state_classifier_hidden_sizes = [256, 128]
         if self.use_bc_head and self.num_actions is None:
             raise ValueError("num_actions must be specified when use_bc_head=True")
         if self.use_state_decoder and self.state_dim is None:
             raise ValueError("state_dim must be specified when use_state_decoder=True")
+        if self.use_state_classifier and self.state_dim is None:
+            raise ValueError("state_dim must be specified when use_state_classifier=True")
 
 
 def load_data_config(config_path: Union[str, Path]) -> DataConfig:

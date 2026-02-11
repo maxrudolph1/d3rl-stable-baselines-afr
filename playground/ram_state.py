@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-path = '/u/mrudolph/documents/d3rlpy/atari_data/atari_data_with_state/BreakoutNoFrameskip-v4/dqn'
+path = '/u/mrudolph/documents/d3rlpy/atari_data/test/BreakoutNoFrameskip-v4/dqn'
 import os
 
 def list_pth_files(directory):

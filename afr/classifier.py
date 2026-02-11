@@ -238,3 +238,64 @@ class StateDecoderHead(nn.Module):
             Predicted normalized state, shape (batch_size, state_dim).
         """
         return self.network(embedding)
+
+
+class StateClassifier(nn.Module):
+    """
+    Classifier that predicts source_id from normalized state.
+
+    Takes d-dimensional normalized state (e.g. RAM state) and outputs
+    logits over num_sources, matching the observation classifier's
+    output space. Used when batches include normalized_states.
+
+    Args:
+        state_dim: Dimension of the normalized state input.
+        num_sources: Number of source datasets/policies to classify.
+        hidden_sizes: List of hidden layer sizes. Defaults to [256, 128].
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        num_sources: int,
+        hidden_sizes: list = None,
+    ):
+        super().__init__()
+
+        if hidden_sizes is None:
+            hidden_sizes = [256, 128]
+
+        self.state_dim = state_dim
+        self.num_sources = num_sources
+
+        layers = []
+        in_size = state_dim
+        for hidden_size in hidden_sizes:
+            layers.append(nn.Linear(in_size, hidden_size))
+            layers.append(nn.ReLU())
+            in_size = hidden_size
+
+        layers.append(nn.Linear(in_size, num_sources))
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+
+        Args:
+            state: Normalized state, shape (batch_size, state_dim).
+
+        Returns:
+            Logits of shape (batch_size, num_sources).
+        """
+        return self.network(state)
+
+    def predict_proba(self, state: torch.Tensor) -> torch.Tensor:
+        """Get probability predictions."""
+        logits = self.forward(state)
+        return torch.softmax(logits, dim=-1)
+
+    def predict(self, state: torch.Tensor) -> torch.Tensor:
+        """Get class predictions."""
+        logits = self.forward(state)
+        return torch.argmax(logits, dim=-1)

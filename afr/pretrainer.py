@@ -24,9 +24,9 @@ except ImportError:
 
 import d3rlpy
 
-from afr.classifier import CARDPOLClassifier, BehaviorCloningHead, StateDecoderHead
+from afr.classifier import CARDPOLClassifier, BehaviorCloningHead, StateDecoderHead, StateClassifier
 from afr.extended_dataset import CombinedMDPDataset, TrajectoryBatchWithSource
-from afr.losses import cardpol_loss, bc_loss, state_decoder_loss, normalize_pixel_obs
+from afr.losses import cardpol_loss, bc_loss, state_decoder_loss, state_classifier_loss, normalize_pixel_obs
 
 
 class EncoderPretrainer:
@@ -58,6 +58,7 @@ class EncoderPretrainer:
         classifier: Optional[CARDPOLClassifier] = None,
         bc_head: Optional[BehaviorCloningHead] = None,
         state_decoder: Optional[StateDecoderHead] = None,
+        state_classifier: Optional[StateClassifier] = None,
         val_combined_dataset: Optional[CombinedMDPDataset] = None,
     ):
         """
@@ -74,6 +75,8 @@ class EncoderPretrainer:
                     If None and config.use_bc_head=True, one will be created.
             state_decoder: Optional pre-initialized StateDecoderHead.
                     If None and config.use_state_decoder=True, one will be created.
+            state_classifier: Optional pre-initialized StateClassifier.
+                    If None and config.use_state_classifier=True, one will be created.
             val_combined_dataset: Optional validation CombinedMDPDataset for
                                   evaluating classifier accuracy during training.
         """
@@ -135,6 +138,23 @@ class EncoderPretrainer:
                 lr=config.state_decoder_learning_rate,
             )
 
+        # Create or use provided state classifier (if enabled)
+        self.state_classifier = None
+        self.state_classifier_optimizer = None
+        if config.use_state_classifier:
+            if state_classifier is not None:
+                self.state_classifier = state_classifier.to(self.device)
+            else:
+                self.state_classifier = StateClassifier(
+                    state_dim=config.state_dim,
+                    num_sources=config.num_sources,
+                    hidden_sizes=config.state_classifier_hidden_sizes,
+                ).to(self.device)
+            self.state_classifier_optimizer = optim.Adam(
+                self.state_classifier.parameters(),
+                lr=config.state_classifier_learning_rate,
+            )
+
         # Set up optimizer for encoder parameters
         encoder_params = []
         for encoder in self.encoders:
@@ -184,6 +204,9 @@ class EncoderPretrainer:
                 "state_dim": config.state_dim,
                 "state_decoder_learning_rate": config.state_decoder_learning_rate,
                 "state_decoder_loss_weight": config.state_decoder_loss_weight,
+                "use_state_classifier": config.use_state_classifier,
+                "state_classifier_learning_rate": config.state_classifier_learning_rate,
+                "state_classifier_loss_weight": config.state_classifier_loss_weight,
                 "group": config.group,
             }
             wandb.init(
@@ -200,6 +223,8 @@ class EncoderPretrainer:
                 wandb.watch(self.bc_head, log="gradients", log_freq=config.log_interval)
             if self.state_decoder is not None:
                 wandb.watch(self.state_decoder, log="gradients", log_freq=config.log_interval)
+            if self.state_classifier is not None:
+                wandb.watch(self.state_classifier, log="gradients", log_freq=config.log_interval)
 
     def _compute_encoder_feature_size(self) -> int:
         """Compute the output feature size of the encoder."""
@@ -250,7 +275,6 @@ class EncoderPretrainer:
             batch_size=self.config.batch_size,
             length=self.config.trajectory_length,
         )
-        import pdb; pdb.set_trace()
         trajectory_batch, source_ids = self._prepare_trajectory_batch(batch_with_source)
 
         # Compute loss for each encoder
@@ -263,6 +287,8 @@ class EncoderPretrainer:
             self.bc_head.train()
         if self.state_decoder is not None:
             self.state_decoder.train()
+        if self.state_classifier is not None:
+            self.state_classifier.train()
 
         # Use the first encoder for the loss (they share the same architecture)
         cardpol_loss_val, metrics = self.loss_fn(
@@ -332,12 +358,28 @@ class EncoderPretrainer:
             all_metrics["state_decoder_loss"] = state_decoder_loss_val.item()
             all_metrics.update(state_decoder_metrics)
 
+        # State classifier loss: predict source_id from normalized_state (no encoder)
+        if self.state_classifier is not None and batch_with_source.normalized_states is not None:
+            state_classifier_loss_val, state_classifier_metrics = state_classifier_loss(
+                state_classifier=self.state_classifier,
+                normalized_states=batch_with_source.normalized_states,
+                source_ids=source_ids,
+                device=self.device,
+            )
+            self.state_classifier_optimizer.zero_grad()
+            state_classifier_loss_val.backward()
+            self.state_classifier_optimizer.step()
+            all_metrics["state_classifier_loss"] = state_classifier_loss_val.item()
+            all_metrics.update(state_classifier_metrics)
+
         # Compute total loss for logging (weighted sum)
         total_loss = cardpol_loss_val.item()
         if self.bc_head is not None:
             total_loss += self.config.bc_loss_weight * bc_loss_val.item()
         if self.state_decoder is not None and "state_decoder_loss" in all_metrics:
             total_loss += self.config.state_decoder_loss_weight * all_metrics["state_decoder_loss"]
+        if self.state_classifier is not None and "state_classifier_loss" in all_metrics:
+            total_loss += self.config.state_classifier_loss_weight * all_metrics["state_classifier_loss"]
         all_metrics["loss"] = total_loss
 
         return all_metrics
@@ -361,6 +403,8 @@ class EncoderPretrainer:
             self.bc_head.eval()
         if self.state_decoder is not None:
             self.state_decoder.eval()
+        if self.state_classifier is not None:
+            self.state_classifier.eval()
 
         total_loss = 0.0
         total_correct = 0
@@ -376,6 +420,10 @@ class EncoderPretrainer:
         # State decoder validation metrics
         state_decoder_total_mae = 0.0
         state_decoder_n_batches = 0
+
+        # State classifier validation metrics
+        state_classifier_total_correct = 0
+        state_classifier_total_samples = 0
 
         for _ in range(self.config.val_n_batches):
             # Sample validation batch
@@ -455,6 +503,24 @@ class EncoderPretrainer:
                 state_decoder_total_mae += state_decoder_metrics["state_decoder_mae"]
                 state_decoder_n_batches += 1
 
+            # State classifier validation when batch has normalized_states
+            if (
+                self.state_classifier is not None
+                and batch_with_source.normalized_states is not None
+            ):
+                _, state_classifier_metrics = state_classifier_loss(
+                    state_classifier=self.state_classifier,
+                    normalized_states=batch_with_source.normalized_states,
+                    source_ids=source_ids,
+                    device=self.device,
+                )
+                # Recompute accuracy from loss batch size for val metric
+                batch_size = batch_with_source.normalized_states.shape[0]
+                state_classifier_total_correct += int(
+                    state_classifier_metrics["state_classifier_accuracy"] * batch_size
+                )
+                state_classifier_total_samples += batch_size
+
         # Set models back to train mode
         for encoder in self.encoders:
             encoder.train()
@@ -463,6 +529,8 @@ class EncoderPretrainer:
             self.bc_head.train()
         if self.state_decoder is not None:
             self.state_decoder.train()
+        if self.state_classifier is not None:
+            self.state_classifier.train()
 
         if total_samples == 0:
             return {"val_accuracy": 0.0, "val_loss": 0.0}
@@ -493,6 +561,12 @@ class EncoderPretrainer:
                 state_decoder_total_mae / state_decoder_n_batches
             )
 
+        # Add state classifier validation metrics
+        if self.state_classifier is not None and state_classifier_total_samples > 0:
+            val_metrics["val_state_classifier_accuracy"] = (
+                state_classifier_total_correct / state_classifier_total_samples
+            )
+
         return val_metrics
 
     def pretrain(self) -> None:
@@ -514,6 +588,8 @@ class EncoderPretrainer:
         if self.state_decoder is not None:
             print(f"State decoder enabled: state_dim={self.config.state_dim}, weight={self.config.state_decoder_loss_weight}")
             print(f"  NOTE: State decoder gradients do NOT backpropagate to encoder")
+        if self.state_classifier is not None:
+            print(f"State classifier enabled: state_dim={self.config.state_dim}, weight={self.config.state_classifier_loss_weight}")
         print("-" * 50)
 
         best_val_accuracy = 0.0
@@ -598,15 +674,17 @@ class EncoderPretrainer:
         include_classifier: bool = True,
         include_bc_head: bool = True,
         include_state_decoder: bool = True,
+        include_state_classifier: bool = True,
     ) -> None:
         """
-        Save encoder, classifier, BC head, and state decoder weights to a file.
+        Save encoder, classifier, BC head, state decoder, and state classifier weights to a file.
 
         Args:
             path: Path to save the weights.
             include_classifier: Whether to include classifier weights.
             include_bc_head: Whether to include BC head weights.
             include_state_decoder: Whether to include state decoder weights.
+            include_state_classifier: Whether to include state classifier weights.
         """
         state_dict = {}
         for i, encoder in enumerate(self.encoders):
@@ -634,6 +712,13 @@ class EncoderPretrainer:
                 "state_dim": self.state_decoder.state_dim,
             }
 
+        if include_state_classifier and self.state_classifier is not None:
+            state_dict["state_classifier"] = self.state_classifier.state_dict()
+            state_dict["state_classifier_config"] = {
+                "state_dim": self.state_classifier.state_dim,
+                "num_sources": self.state_classifier.num_sources,
+            }
+
         torch.save(state_dict, path)
         print(f"Saved encoder weights to {path}")
 
@@ -643,15 +728,17 @@ class EncoderPretrainer:
         load_classifier: bool = True,
         load_bc_head: bool = True,
         load_state_decoder: bool = True,
+        load_state_classifier: bool = True,
     ) -> None:
         """
-        Load encoder, classifier, BC head, and state decoder weights from a file.
+        Load encoder, classifier, BC head, state decoder, and state classifier weights from a file.
 
         Args:
             path: Path to load the weights from.
             load_classifier: Whether to load classifier weights.
             load_bc_head: Whether to load BC head weights.
             load_state_decoder: Whether to load state decoder weights.
+            load_state_classifier: Whether to load state classifier weights.
         """
         state_dict = torch.load(path, map_location=self.device)
         for i, encoder in enumerate(self.encoders):
@@ -670,6 +757,10 @@ class EncoderPretrainer:
         if load_state_decoder and "state_decoder" in state_dict and self.state_decoder is not None:
             self.state_decoder.load_state_dict(state_dict["state_decoder"])
             loaded_components.append("state_decoder")
+
+        if load_state_classifier and "state_classifier" in state_dict and self.state_classifier is not None:
+            self.state_classifier.load_state_dict(state_dict["state_classifier"])
+            loaded_components.append("state_classifier")
 
         print(f"Loaded {', '.join(loaded_components)} weights from {path}")
 

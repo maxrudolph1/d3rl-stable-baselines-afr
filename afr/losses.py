@@ -8,7 +8,7 @@ import torch.nn as nn
 
 from d3rlpy.dataset import TrajectoryMiniBatch
 
-from afr.classifier import CARDPOLClassifier, BehaviorCloningHead, StateDecoderHead
+from afr.classifier import CARDPOLClassifier, BehaviorCloningHead, StateDecoderHead, StateClassifier
 
 
 def normalize_pixel_obs(obs: torch.Tensor) -> torch.Tensor:
@@ -245,5 +245,48 @@ def state_decoder_loss(
 
     metrics = {
         "state_decoder_mae": mae.item(),
+    }
+    return loss, metrics
+
+
+def state_classifier_loss(
+    state_classifier: StateClassifier,
+    normalized_states: np.ndarray,
+    source_ids: np.ndarray,
+    device: str = "cuda:0",
+) -> tuple:
+    """
+    State classifier loss: predict source_id from normalized state.
+
+    Uses the state at t=0 for each trajectory. Cross-entropy loss
+    against the trajectory's source_id.
+
+    Args:
+        state_classifier: The StateClassifier to train.
+        normalized_states: Ground-truth normalized states, shape (B, L, state_dim).
+        source_ids: Source ID per trajectory, shape (B,).
+        device: Device to run on.
+
+    Returns:
+        Tuple of (loss, metrics_dict).
+    """
+    if isinstance(normalized_states, np.ndarray):
+        normalized_states = torch.from_numpy(normalized_states)
+    if isinstance(source_ids, np.ndarray):
+        source_ids = torch.from_numpy(source_ids)
+
+    # Use state at t=0: (B, state_dim)
+    state_t0 = normalized_states[:, 0].to(device).float()
+    labels = source_ids.long().to(device)
+
+    logits = state_classifier(state_t0)  # (B, num_sources)
+    loss = nn.functional.cross_entropy(logits, labels)
+
+    with torch.no_grad():
+        predictions = torch.argmax(logits, dim=-1)
+        accuracy = (predictions == labels).float().mean().item()
+
+    metrics = {
+        "state_classifier_accuracy": accuracy,
     }
     return loss, metrics
