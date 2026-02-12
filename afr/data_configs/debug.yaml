@@ -11,15 +11,15 @@
 #   - A string (path only; label defaults to index)
 
 environment: "BreakoutNoFrameskip-v4"
-
+normalized_state_dim: 128
 data:
-  - path: "atari_data/BreakoutNoFrameskip-v4/dqn/ckpt_0_10000.pth"
+  - path: "atari_data/BreakoutNoFrameskip-v4/dqn/ckpt_0_100000.pth"
     label: 0
-  - path: "atari_data/BreakoutNoFrameskip-v4/dqn/ckpt_9_10000.pth"
+  - path: "atari_data/BreakoutNoFrameskip-v4/dqn/ckpt_3_100000.pth"
     label: 1
 
 validation_data:
   - path: "atari_data/BreakoutNoFrameskip-v4/dqn/ckpt_0_10000.pth"
     label: 0
-  - path: "atari_data/BreakoutNoFrameskip-v4/dqn/ckpt_9_10000.pth"
+  - path: "atari_data/BreakoutNoFrameskip-v4/dqn/ckpt_3_10000.pth"
     label: 1

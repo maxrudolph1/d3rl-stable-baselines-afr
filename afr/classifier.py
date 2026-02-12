@@ -198,14 +198,14 @@ class StateDecoderHead(nn.Module):
 
     Args:
         embedding_size: Size of the embedding from the encoder.
-        state_dim: Dimension of the normalized state to predict.
+        normalized_state_dim: Dimension of the normalized state to predict (from data YAML).
         hidden_sizes: List of hidden layer sizes. Defaults to [256, 128].
     """
 
     def __init__(
         self,
         embedding_size: int,
-        state_dim: int,
+        normalized_state_dim: int,
         hidden_sizes: list = None,
     ):
         super().__init__()
@@ -214,7 +214,7 @@ class StateDecoderHead(nn.Module):
             hidden_sizes = [256, 128]
 
         self.embedding_size = embedding_size
-        self.state_dim = state_dim
+        self.normalized_state_dim = normalized_state_dim
 
         layers = []
         in_size = embedding_size
@@ -223,7 +223,7 @@ class StateDecoderHead(nn.Module):
             layers.append(nn.ReLU())
             in_size = hidden_size
 
-        layers.append(nn.Linear(in_size, state_dim))
+        layers.append(nn.Linear(in_size, normalized_state_dim))
         self.network = nn.Sequential(*layers)
 
     def forward(self, embedding: torch.Tensor) -> torch.Tensor:
@@ -235,7 +235,7 @@ class StateDecoderHead(nn.Module):
                       Should be detached to prevent gradient flow back to encoder.
 
         Returns:
-            Predicted normalized state, shape (batch_size, state_dim).
+            Predicted normalized state, shape (batch_size, normalized_state_dim).
         """
         return self.network(embedding)
 
@@ -249,14 +249,14 @@ class StateClassifier(nn.Module):
     output space. Used when batches include normalized_states.
 
     Args:
-        state_dim: Dimension of the normalized state input.
+        normalized_state_dim: Dimension of the normalized state input (from data YAML).
         num_sources: Number of source datasets/policies to classify.
         hidden_sizes: List of hidden layer sizes. Defaults to [256, 128].
     """
 
     def __init__(
         self,
-        state_dim: int,
+        normalized_state_dim: int,
         num_sources: int,
         hidden_sizes: list = None,
     ):
@@ -265,11 +265,11 @@ class StateClassifier(nn.Module):
         if hidden_sizes is None:
             hidden_sizes = [256, 128]
 
-        self.state_dim = state_dim
+        self.normalized_state_dim = normalized_state_dim
         self.num_sources = num_sources
 
         layers = []
-        in_size = state_dim
+        in_size = normalized_state_dim
         for hidden_size in hidden_sizes:
             layers.append(nn.Linear(in_size, hidden_size))
             layers.append(nn.ReLU())
@@ -283,7 +283,7 @@ class StateClassifier(nn.Module):
         Forward pass.
 
         Args:
-            state: Normalized state, shape (batch_size, state_dim).
+            state: Normalized state, shape (batch_size, normalized_state_dim).
 
         Returns:
             Logits of shape (batch_size, num_sources).

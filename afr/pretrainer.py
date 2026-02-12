@@ -120,7 +120,6 @@ class EncoderPretrainer:
                 self.bc_head.parameters(),
                 lr=config.bc_learning_rate
             )
-
         # Create or use provided state decoder head (if enabled)
         self.state_decoder = None
         self.state_decoder_optimizer = None
@@ -130,7 +129,7 @@ class EncoderPretrainer:
             else:
                 self.state_decoder = StateDecoderHead(
                     embedding_size=encoder_feature_size,
-                    state_dim=config.state_dim,
+                    normalized_state_dim=config.normalized_state_dim,
                     hidden_sizes=config.state_decoder_hidden_sizes,
                 ).to(self.device)
             self.state_decoder_optimizer = optim.Adam(
@@ -146,7 +145,7 @@ class EncoderPretrainer:
                 self.state_classifier = state_classifier.to(self.device)
             else:
                 self.state_classifier = StateClassifier(
-                    state_dim=config.state_dim,
+                    normalized_state_dim=config.normalized_state_dim,
                     num_sources=config.num_sources,
                     hidden_sizes=config.state_classifier_hidden_sizes,
                 ).to(self.device)
@@ -201,7 +200,7 @@ class EncoderPretrainer:
                 "num_actions": config.num_actions,
                 # State decoder config
                 "use_state_decoder": config.use_state_decoder,
-                "state_dim": config.state_dim,
+                "normalized_state_dim": config.normalized_state_dim,
                 "state_decoder_learning_rate": config.state_decoder_learning_rate,
                 "state_decoder_loss_weight": config.state_decoder_loss_weight,
                 "use_state_classifier": config.use_state_classifier,
@@ -586,10 +585,10 @@ class EncoderPretrainer:
             print(f"BC head enabled: {self.config.num_actions} actions, weight={self.config.bc_loss_weight}")
             print(f"  NOTE: BC gradients do NOT backpropagate to encoder")
         if self.state_decoder is not None:
-            print(f"State decoder enabled: state_dim={self.config.state_dim}, weight={self.config.state_decoder_loss_weight}")
+            print(f"State decoder enabled: normalized_state_dim={self.config.normalized_state_dim}, weight={self.config.state_decoder_loss_weight}")
             print(f"  NOTE: State decoder gradients do NOT backpropagate to encoder")
         if self.state_classifier is not None:
-            print(f"State classifier enabled: state_dim={self.config.state_dim}, weight={self.config.state_classifier_loss_weight}")
+            print(f"State classifier enabled: normalized_state_dim={self.config.normalized_state_dim}, weight={self.config.state_classifier_loss_weight}")
         print("-" * 50)
 
         best_val_accuracy = 0.0
@@ -709,13 +708,13 @@ class EncoderPretrainer:
             state_dict["state_decoder"] = self.state_decoder.state_dict()
             state_dict["state_decoder_config"] = {
                 "embedding_size": self.state_decoder.embedding_size,
-                "state_dim": self.state_decoder.state_dim,
+                "normalized_state_dim": self.state_decoder.normalized_state_dim,
             }
 
         if include_state_classifier and self.state_classifier is not None:
             state_dict["state_classifier"] = self.state_classifier.state_dict()
             state_dict["state_classifier_config"] = {
-                "state_dim": self.state_classifier.state_dim,
+                "normalized_state_dim": self.state_classifier.normalized_state_dim,
                 "num_sources": self.state_classifier.num_sources,
             }
 

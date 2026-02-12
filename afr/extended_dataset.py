@@ -20,6 +20,8 @@ class TransitionWithSource(NamedTuple):
     """Transition with source dataset identifier."""
     transition: Transition
     source_id: int
+    state: np.ndarray  # (128,) raw RAM; required
+    normalized_state: np.ndarray  # (normalized_state_dim,) required
     source_name: Optional[str] = None
 
 
@@ -27,14 +29,18 @@ class TrajectoryWithSource(NamedTuple):
     """Trajectory with source dataset identifier."""
     trajectory: PartialTrajectory
     source_id: int
+    state: np.ndarray  # (L, 128) raw RAM; required
+    normalized_state: np.ndarray  # (L, normalized_state_dim) required
     source_name: Optional[str] = None
-    local_index: Optional[int] = None  # flat index in source dataset (for normalized_state slicing)
+    local_index: Optional[int] = None  # flat index in source dataset (for state/normalized_state slicing)
 
 
 class TransitionBatchWithSource(NamedTuple):
     """Transition mini-batch with source dataset identifiers."""
     batch: TransitionMiniBatch
     source_ids: np.ndarray  # (batch_size,)
+    states: np.ndarray  # (B, 128) raw RAM; required
+    normalized_states: np.ndarray  # (B, normalized_state_dim) required
     source_names: Optional[List[str]] = None
 
 
@@ -42,9 +48,9 @@ class TrajectoryBatchWithSource(NamedTuple):
     """Trajectory mini-batch with source dataset identifiers."""
     batch: TrajectoryMiniBatch
     source_ids: np.ndarray  # (batch_size,)
+    states: np.ndarray  # (B, L, 128) raw RAM; required
+    normalized_states: np.ndarray  # (B, L, normalized_state_dim) required
     source_names: Optional[List[str]] = None
-    # Optional normalized state targets (B, L, state_dim) when datasets have "normalized_state"
-    normalized_states: Optional[np.ndarray] = None
 
 
 class CombinedMDPDataset:
@@ -58,37 +64,60 @@ class CombinedMDPDataset:
                datasets are identified by their index.
         transition_picker: Optional transition picker for sampling.
         trajectory_slicer: Optional trajectory slicer for sampling.
+        states: Required per-dataset state arrays (N_i, 128) raw RAM aligned with
+                transitions. All datasets must have state and normalized_state.
+        normalized_states: Required per-dataset normalized_state arrays (N_i, normalized_state_dim).
     
     Example:
         >>> dataset1 = MDPDataset(obs1, actions1, rewards1, terminals1)
         >>> dataset2 = MDPDataset(obs2, actions2, rewards2, terminals2)
         >>> combined = CombinedMDPDataset(
         ...     datasets=[dataset1, dataset2],
+        ...     states=[state1, state2],
+        ...     normalized_states=[norm_state1, norm_state2],
         ...     names=["expert", "random"]
         ... )
-        >>> batch, source_ids = combined.sample_transition_batch(32)
-        >>> # source_ids[i] tells you which dataset transition i came from
+        >>> batch = combined.sample_transition_batch(32)
+        >>> # batch.source_ids[i] tells you which dataset transition i came from
     """
     
     def __init__(
         self,
         datasets: List[Union[MDPDataset, ReplayBuffer]],
+        states: Sequence[np.ndarray],
+        normalized_states: Sequence[np.ndarray],
         names: Optional[List[str]] = None,
         transition_picker: Optional[TransitionPickerProtocol] = None,
         trajectory_slicer: Optional[TrajectorySlicerProtocol] = None,
-        normalized_states: Optional[Sequence[Optional[np.ndarray]]] = None,
     ):
         if len(datasets) == 0:
             raise ValueError("At least one dataset must be provided")
 
         self._datasets = datasets
-        self._names = names or [f"dataset_{i}" for i in range(len(datasets))]
         self._transition_picker = transition_picker or BasicTransitionPicker()
         self._trajectory_slicer = trajectory_slicer or BasicTrajectorySlicer()
-        # Per-dataset optional normalized_state array (N_i, state_dim); None if not available
-        self._normalized_states = list(normalized_states) if normalized_states else [None] * len(datasets)
-        if len(self._normalized_states) != len(datasets):
-            self._normalized_states = list(self._normalized_states) + [None] * (len(datasets) - len(self._normalized_states))
+
+        # Per-dataset state and normalized_state arrays; required for all datasets
+        if states is None or len(states) != len(datasets):
+            raise ValueError(
+                "states must be provided and have one array per dataset; "
+                "all datasets must have state and normalized_state features"
+            )
+        if normalized_states is None or len(normalized_states) != len(datasets):
+            raise ValueError(
+                "normalized_states must be provided and have one array per dataset; "
+                "all datasets must have state and normalized_state features"
+            )
+        names = names or [f"dataset_{i}" for i in range(len(datasets))]
+        for i, (s, ns) in enumerate(zip(states, normalized_states)):
+            if s is None or ns is None:
+                raise ValueError(
+                    f"Dataset {i} ({names[i]}) is missing state or normalized_state; "
+                    "all datasets must have both features"
+                )
+        self._states = list(states)
+        self._normalized_states = list(normalized_states)
+        self._names = names
 
         if len(self._names) != len(self._datasets):
             raise ValueError("Number of names must match number of datasets")
@@ -159,11 +188,16 @@ class CombinedMDPDataset:
         dataset = self._datasets[dataset_idx]
         episode, transition_index = dataset.buffer[local_index]
         transition = self._transition_picker(episode, transition_index)
-        
+
+        state = self._states[dataset_idx][local_index : local_index + 1].squeeze(0)
+        normalized_state = self._normalized_states[dataset_idx][local_index : local_index + 1].squeeze(0)
+
         return TransitionWithSource(
             transition=transition,
             source_id=dataset_idx,
             source_name=self._names[dataset_idx],
+            state=state,
+            normalized_state=normalized_state,
         )
     
     def sample_transition_batch(
@@ -179,17 +213,21 @@ class CombinedMDPDataset:
             TransitionBatchWithSource containing the batch and source info.
         """
         samples = [self.sample_transition() for _ in range(batch_size)]
-        
+
         transitions = [s.transition for s in samples]
         source_ids = np.array([s.source_id for s in samples], dtype=np.int64)
         source_names = [s.source_name for s in samples]
-        
+        states = np.stack([s.state for s in samples], axis=0)
+        normalized_states = np.stack([s.normalized_state for s in samples], axis=0)
+
         batch = TransitionMiniBatch.from_transitions(transitions)
-        
+
         return TransitionBatchWithSource(
             batch=batch,
             source_ids=source_ids,
             source_names=source_names,
+            states=states,
+            normalized_states=normalized_states,
         )
     
     def sample_trajectory(self, length: int) -> TrajectoryWithSource:
@@ -204,16 +242,24 @@ class CombinedMDPDataset:
         """
         global_index = np.random.randint(self.transition_count)
         dataset_idx, local_index = self._global_to_local_index(global_index)
-
         dataset = self._datasets[dataset_idx]
         episode, transition_index = dataset.buffer[local_index]
         trajectory = self._trajectory_slicer(episode, transition_index, length)
+
+        state = self._extract_state_slice_for_trajectory(
+            dataset_idx, local_index, transition_index, length, self._states
+        )
+        normalized_state = self._extract_state_slice_for_trajectory(
+            dataset_idx, local_index, transition_index, length, self._normalized_states
+        )
 
         return TrajectoryWithSource(
             trajectory=trajectory,
             source_id=dataset_idx,
             source_name=self._names[dataset_idx],
             local_index=local_index,
+            state=state,
+            normalized_state=normalized_state,
         )
     
     def sample_trajectory_batch(
@@ -228,8 +274,8 @@ class CombinedMDPDataset:
 
         Returns:
             TrajectoryBatchWithSource containing the batch and source info.
-            normalized_states is set only when all sampled trajectories come from
-            datasets that have normalized_states and all have the same state_dim.
+            states and normalized_states are set only when all sampled trajectories
+            come from datasets that have the corresponding arrays and share the same dimension.
         """
         samples = [self.sample_trajectory(length) for _ in range(batch_size)]
 
@@ -239,38 +285,70 @@ class CombinedMDPDataset:
 
         batch = TrajectoryMiniBatch.from_partial_trajectories(trajectories)
 
-        # Build normalized_states (B, L, state_dim) if all samples have it
-        normalized_states_batch = None
-        if all(self._normalized_states[s.source_id] is not None for s in samples):
-            state_dim = self._normalized_states[samples[0].source_id].shape[-1]
-            if all(
-                self._normalized_states[s.source_id].shape[-1] == state_dim
-                for s in samples
-            ):
-                normalized_states_batch = self._build_normalized_states_batch(
-                    samples, length, batch_size, state_dim
-                )
+        # Build states (B, L, 128) if all samples have it
+        states_batch = self._build_state_like_batch(
+            samples, length, batch_size, self._states
+        )
+        
+        # Build normalized_states (B, L, normalized_state_dim) if all samples have it
+        normalized_states_batch = self._build_state_like_batch(
+            samples, length, batch_size, self._normalized_states
+        )
 
         return TrajectoryBatchWithSource(
             batch=batch,
             source_ids=source_ids,
             source_names=source_names,
+            states=states_batch,
             normalized_states=normalized_states_batch,
         )
 
-    def _build_normalized_states_batch(
+    def _extract_state_slice_for_trajectory(
+        self,
+        dataset_idx: int,
+        local_index: int,
+        transition_index: int,
+        length: int,
+        per_dataset_arrays: List[np.ndarray],
+    ) -> np.ndarray:
+        """Extract (length, dim) state slice for a single trajectory (dim=128 or normalized_state_dim)."""
+        arr = per_dataset_arrays[dataset_idx]
+        dataset = self._datasets[dataset_idx]
+        state_dim = arr.shape[-1]
+        out = np.zeros((length, state_dim), dtype=np.float32)
+        start = max(0, transition_index + 1 - length)
+        end = transition_index + 1
+        actual_size = end - start
+        start_flat = local_index - transition_index + start
+        n_valid = actual_size if start_flat >= 0 else actual_size + start_flat
+        n_valid = max(0, min(n_valid, arr.shape[0] - max(0, start_flat)))
+        if n_valid <= 0:
+            return out  # zeros
+        src_start = max(0, start_flat)
+        out[length - n_valid : length] = arr[src_start : src_start + n_valid]
+        return out
+
+    def _build_state_like_batch(
         self,
         samples: List[TrajectoryWithSource],
         length: int,
         batch_size: int,
-        state_dim: int,
+        per_dataset_arrays: List[np.ndarray],
     ) -> np.ndarray:
-        """Build (B, L, state_dim) array of normalized states for the trajectory batch."""
+        """Build (B, L, dim) array from per-dataset state arrays. All datasets must have the array."""
+        state_dim = per_dataset_arrays[samples[0].source_id].shape[-1]
+        if not all(
+            per_dataset_arrays[s.source_id].shape[-1] == state_dim for s in samples
+        ):
+            print([per_dataset_arrays[s.source_id].shape[-1] for s in samples])
+            raise ValueError(
+                "Dimension mismatch: all datasets must have the same state/normalized_state dimension"
+            )
         out = np.zeros((batch_size, length, state_dim), dtype=np.float32)
         for i, s in enumerate(samples):
             dataset_idx = s.source_id
             dataset = self._datasets[dataset_idx]
-            ns = self._normalized_states[dataset_idx]  # (N, state_dim)
+            arr = per_dataset_arrays[dataset_idx]  # (N, dim)
             local_index = s.local_index
             if local_index is None:
                 continue
@@ -280,11 +358,11 @@ class CombinedMDPDataset:
             actual_size = end - start
             start_flat = local_index - transition_index + start
             n_valid = actual_size if start_flat >= 0 else actual_size + start_flat
-            n_valid = max(0, min(n_valid, ns.shape[0] - max(0, start_flat)))
+            n_valid = max(0, min(n_valid, arr.shape[0] - max(0, start_flat)))
             if n_valid <= 0:
                 continue
             src_start = max(0, start_flat)
-            out[i, length - n_valid : length] = ns[src_start : src_start + n_valid]
+            out[i, length - n_valid : length] = arr[src_start : src_start + n_valid]
         return out
 
     def sample_from_dataset(
@@ -304,39 +382,61 @@ class CombinedMDPDataset:
             raise IndexError(f"Dataset index {dataset_idx} out of range")
         
         return self._datasets[dataset_idx].sample_transition_batch(batch_size)
-    
+
+    def _sample_transition_from_dataset(self, dataset_idx: int) -> TransitionWithSource:
+        """Sample a single transition from a specific dataset."""
+        dataset = self._datasets[dataset_idx]
+        local_index = np.random.randint(dataset.transition_count)
+        episode, transition_index = dataset.buffer[local_index]
+        transition = self._transition_picker(episode, transition_index)
+        state = self._states[dataset_idx][local_index : local_index + 1].squeeze(0)
+        normalized_state = self._normalized_states[dataset_idx][local_index : local_index + 1].squeeze(0)
+        return TransitionWithSource(
+            transition=transition,
+            source_id=dataset_idx,
+            source_name=self._names[dataset_idx],
+            state=state,
+            normalized_state=normalized_state,
+        )
+
     def sample_balanced_batch(
         self, batch_size_per_dataset: int
     ) -> TransitionBatchWithSource:
         """
         Sample an equal number of transitions from each dataset.
-        
+
         Args:
             batch_size_per_dataset: Number of transitions to sample from each dataset.
-        
+
         Returns:
             TransitionBatchWithSource with balanced sampling.
         """
         all_transitions = []
         all_source_ids = []
         all_source_names = []
-        
-        for dataset_idx, dataset in enumerate(self._datasets):
-            batch = dataset.sample_transition_batch(batch_size_per_dataset)
-            # Extract individual transitions
-            for i in range(batch_size_per_dataset):
-                transition = self._datasets[dataset_idx].sample_transition()
-                all_transitions.append(transition)
-                all_source_ids.append(dataset_idx)
-                all_source_names.append(self._names[dataset_idx])
-        
+        all_states = []
+        all_normalized_states = []
+
+        for dataset_idx in range(len(self._datasets)):
+            for _ in range(batch_size_per_dataset):
+                s = self._sample_transition_from_dataset(dataset_idx)
+                all_transitions.append(s.transition)
+                all_source_ids.append(s.source_id)
+                all_source_names.append(s.source_name)
+                all_states.append(s.state)
+                all_normalized_states.append(s.normalized_state)
+
         batch = TransitionMiniBatch.from_transitions(all_transitions)
         source_ids = np.array(all_source_ids, dtype=np.int64)
-        
+        states = np.stack(all_states, axis=0)
+        normalized_states = np.stack(all_normalized_states, axis=0)
+
         return TransitionBatchWithSource(
             batch=batch,
             source_ids=source_ids,
             source_names=all_source_names,
+            states=states,
+            normalized_states=normalized_states,
         )
     
     def get_dataset_info(self) -> dict:
@@ -390,13 +490,18 @@ if __name__ == "__main__":
     env = make_env(env_id)
 
     datasets = []
+    states_list = []
+    normalized_states_list = []
     for data_path in data_paths:
         data = torch.load(data_path, weights_only=False)
+        if 'state' not in data or 'normalized_state' not in data:
+            raise ValueError(
+                f"{data_path} missing 'state' or 'normalized_state'. All datasets must have both."
+            )
         observations = data['obs']
         actions = data['action']
         rewards = data['reward']
         terminals = data['done']
-
         dataset = d3rlpy.dataset.MDPDataset(
             observations=observations,
             actions=actions,
@@ -406,6 +511,13 @@ if __name__ == "__main__":
             action_size=env.action_space.n,
         )
         datasets.append(dataset)
-        
-    combined = CombinedMDPDataset(datasets=datasets, names=["a2c", "dqn"])
+        states_list.append(data['state'])
+        normalized_states_list.append(data['normalized_state'])
+
+    combined = CombinedMDPDataset(
+        datasets=datasets,
+        states=states_list,
+        normalized_states=normalized_states_list,
+        names=["a2c", "dqn"],
+    )
     import pdb; pdb.set_trace()

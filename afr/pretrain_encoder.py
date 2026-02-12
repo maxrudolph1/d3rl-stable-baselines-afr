@@ -83,9 +83,7 @@ def main():
     args = OmegaConf.from_cli()
     data_config_path = args.data_config
     del args.data_config
-    args = EncoderPretrainConfig(**args)
-    print(args)
-
+    
     # Load data config
     data_config = load_data_config(data_config_path)
     data_paths = data_config.data_paths
@@ -93,6 +91,18 @@ def main():
     labels = [str(l) for l in data_config.data_labels]
     val_labels = [str(l) for l in data_config.validation_data_labels]
     env_id = data_config.environment
+    normalized_state_dim = getattr(
+        data_config, "normalized_state_dim", getattr(data_config, "state_dim", None)
+    )
+    # print(OmegaConf.to_yaml(config))
+
+    # Load data config
+    # data_config = load_data_config(data_config_path)
+    # data_paths = data_config.data_paths
+    # val_data_paths = data_config.validation_data_paths
+    # labels = [str(l) for l in data_config.data_labels]
+    # val_labels = [str(l) for l in data_config.validation_data_labels]
+    # env_id = data_config.environment
 
     print(f"Environment: {env_id}")
     print(f"Training data paths: {len(data_paths)}")
@@ -105,10 +115,19 @@ def main():
     print("\nLoading datasets...")
     datasets = []
     val_datasets = []
+    train_states = []
+    train_normalized_states = []
+    val_states = []
+    val_normalized_states = []
 
     for data_path in data_paths:
         if os.path.exists(data_path):
             data = torch.load(data_path, weights_only=False)
+            if 'state' not in data or 'normalized_state' not in data:
+                raise ValueError(
+                    f"Dataset {data_path} is missing 'state' or 'normalized_state' keys. "
+                    "All datasets must have both state and normalized_state features."
+                )
             dataset = d3rlpy.dataset.MDPDataset(
                 observations=data['obs'],
                 actions=data['action'],
@@ -118,6 +137,8 @@ def main():
                 action_size=env.action_space.n,
             )
             datasets.append(dataset)
+            train_states.append(data['state'])
+            train_normalized_states.append(data['normalized_state'])
             print(f"  Loaded {data_path}")
         else:
             print(f"  Warning: {data_path} not found, skipping...")
@@ -125,6 +146,11 @@ def main():
     for data_path in val_data_paths:
         if os.path.exists(data_path):
             data = torch.load(data_path, weights_only=False)
+            if 'state' not in data or 'normalized_state' not in data:
+                raise ValueError(
+                    f"Dataset {data_path} is missing 'state' or 'normalized_state' keys. "
+                    "All datasets must have both state and normalized_state features."
+                )
             dataset = d3rlpy.dataset.MDPDataset(
                 observations=data['obs'],
                 actions=data['action'],
@@ -134,6 +160,8 @@ def main():
                 action_size=env.action_space.n,
             )
             val_datasets.append(dataset)
+            val_states.append(data['state'])
+            val_normalized_states.append(data['normalized_state'])
             print(f"  Loaded {data_path}")
         else:
             print(f"  Warning: {data_path} not found, skipping...")
@@ -146,58 +174,54 @@ def main():
     train_labels = labels[:len(datasets)]
     combined = CombinedMDPDataset(
         datasets=datasets,
+        states=train_states,
+        normalized_states=train_normalized_states,
         names=train_labels,
     )
     print(f"\n{combined}\n")
 
+
+    
+    # Save the model
+    time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = f"{args.log_dir}/{args.group}/{env_id}/{time_stamp}/"
+    del args.log_dir
+    os.makedirs(log_dir, exist_ok=True)
+    # cql.save(log_dir)
+    print(f"Model saved to {log_dir}")
+
+
+    
+    # Create pre-trainer config
+    config = EncoderPretrainConfig(
+        **args,
+        num_sources=len(datasets),
+        log_dir=log_dir,
+        # Wandb settings
+        wandb_project="cardpol_atari_pretrain",
+        wandb_run_name=f"cardpol_{args.group}_{env_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        wandb_tags=["cardpol", "encoder_pretrain", env_id],
+        normalized_state_dim=normalized_state_dim,
+    )
+    
     # Create CQL model
     print("Creating CQL model...")
     cql = d3rlpy.algos.DiscreteCQLConfig(
         observation_scaler=PixelObservationScaler(),
         reward_scaler=ClipRewardScaler(-1.0, 1.0),
         compile_graph=False,
-    ).create(device=args.device)
+    ).create(device=config.device)
 
     # Build the model with one of the datasets
     cql.build_with_dataset(datasets[0])
     print("CQL model built.")
     
-    # Save the model
-    time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_dir = f"{args.log_dir}/{args.group}/{env_id}/{time_stamp}/"
-    os.makedirs(log_dir, exist_ok=True)
-    # cql.save(log_dir)
-    print(f"Model saved to {log_dir}")
-
-    # Create pre-trainer config
-    config = EncoderPretrainConfig(
-        learning_rate=1e-4,
-        classifier_learning_rate=1e-4,
-        batch_size=args.batch_size,
-        trajectory_length=10,
-        n_steps=args.n_steps,
-        num_sources=len(datasets),
-        classifier_hidden_sizes=[256, 128],
-        classifier_combine_mode="concat",
-        log_interval=100,
-        save_interval=2000,
-        log_dir=log_dir,
-        device=args.device,
-        # Validation settings
-        val_interval=500,
-        val_batch_size=64,
-        val_n_batches=10,
-        # Wandb settings
-        use_wandb=args.use_wandb,
-        wandb_project="cardpol_atari_pretrain",
-        wandb_run_name=f"cardpol_{args.group}_{env_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-        wandb_tags=["cardpol", "encoder_pretrain", env_id],
-    )
-
     # Create validation dataset
     if val_datasets:
         val_combined = CombinedMDPDataset(
             datasets=val_datasets,
+            states=val_states,
+            normalized_states=val_normalized_states,
             names=val_labels[:len(val_datasets)],
         )
         print(f"Validation dataset: {val_combined}\n")

@@ -5,6 +5,11 @@ Loads YAML with OmegaConf (environment, data paths, validation_data).
 """
 
 from dataclasses import dataclass
+
+# Raw RAM state dimension (Atari); state arrays always have this many features.
+STATE_DIM = 128
+
+# Normalized state dimension is variable (filtered from raw state) and defined in data YAML.
 from pathlib import Path
 from typing import List, Tuple, Union
 
@@ -28,15 +33,15 @@ class DataConfig:
     data_labels: List[Union[int, str]]
     validation_data_paths: List[str]
     validation_data_labels: List[Union[int, str]]
-    
+    normalized_state_dim: int | None = None  # From data YAML; dimension of normalized_state after filtering.
     
 @dataclass
 class EncoderPretrainConfig:
     """Configuration for encoder pre-training."""
 
     # Training
-    learning_rate: float = 1e-3
-    classifier_learning_rate: float = 1e-3
+    learning_rate: float = 1e-4
+    classifier_learning_rate: float = 1e-4
     batch_size: int = 512
     trajectory_length: int = 10
     n_steps: int = 100000
@@ -54,28 +59,28 @@ class EncoderPretrainConfig:
     num_actions: int = 4  # Number of discrete actions (required if use_bc_head=True)
 
     # State decoder head configuration (decodes normalized_state from representation; no grad through encoder)
-    use_state_decoder: bool = False  # Whether to train a state decoder when datasets have normalized_state
-    state_dim: int = None  # Dimension of normalize[d state (required if use_state_decoder=True)
+    use_state_decoder: bool = True  # Whether to train a state decoder when datasets have normalized_state
+    normalized_state_dim: int | None = None  # Dimension of normalized_state from data YAML (required if use_state_decoder=True)
     state_decoder_learning_rate: float = 1e-3
     state_decoder_hidden_sizes: list = None  # Default: [256, 128]
     state_decoder_loss_weight: float = 1.0  # Weight for state decoder MSE loss
 
     # State classifier configuration (predicts source_id from normalized_state; no encoder)
-    use_state_classifier: bool = False  # Whether to train a state classifier when batches have normalized_states
+    use_state_classifier: bool = True  # Whether to train a state classifier when batches have normalized_states
     state_classifier_learning_rate: float = 1e-3
     state_classifier_hidden_sizes: list = None  # Default: [256, 128]
     state_classifier_loss_weight: float = 1.0  # Weight for state classifier cross-entropy loss
 
     # Logging
     log_interval: int = 100
-    save_interval: int = 10000
+    save_interval: int = 2000
     log_dir: str = "encoder_pretrain_logs"
     group: str = "default"
 
     # Wandb logging
     use_wandb: bool = True
     wandb_project: str = "encoder_pretrain"
-    wandb_entity: str = None  # None uses default entity
+    wandb_entity: str | None = None  # None uses default entity
     wandb_run_name: str = None  # None auto-generates name
     wandb_tags: list = None  # Optional tags for the run
 
@@ -100,10 +105,10 @@ class EncoderPretrainConfig:
             self.state_classifier_hidden_sizes = [256, 128]
         if self.use_bc_head and self.num_actions is None:
             raise ValueError("num_actions must be specified when use_bc_head=True")
-        if self.use_state_decoder and self.state_dim is None:
-            raise ValueError("state_dim must be specified when use_state_decoder=True")
-        if self.use_state_classifier and self.state_dim is None:
-            raise ValueError("state_dim must be specified when use_state_classifier=True")
+        if self.use_state_decoder and self.normalized_state_dim is None:
+            raise ValueError("normalized_state_dim must be specified when use_state_decoder=True")
+        if self.use_state_classifier and self.normalized_state_dim is None:
+            raise ValueError("normalized_state_dim must be specified when use_state_classifier=True")
 
 
 def load_data_config(config_path: Union[str, Path]) -> DataConfig:
@@ -175,6 +180,8 @@ def load_data_config(config_path: Union[str, Path]) -> DataConfig:
 
     data_paths, data_labels = parse_entries("data")
     validation_data_paths, validation_data_labels = parse_entries("validation_data")
+    # Prefer normalized_state_dim; fall back to state_dim for backwards compatibility.
+    normalized_state_dim = raw.get("normalized_state_dim", raw.get("state_dim", None))
 
     return DataConfig(
         environment=environment,
@@ -182,4 +189,5 @@ def load_data_config(config_path: Union[str, Path]) -> DataConfig:
         data_labels=data_labels,
         validation_data_paths=validation_data_paths,
         validation_data_labels=validation_data_labels,
+        normalized_state_dim=normalized_state_dim,
     )

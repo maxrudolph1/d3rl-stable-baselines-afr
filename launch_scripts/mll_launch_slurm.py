@@ -94,9 +94,9 @@ if __name__ == "__main__":
     script = 'python -m afr.pretrain_encoder'
     sweep_configs = [
         {
-            '--data-config' : 'afr/data_configs/breakout_random-expert.yaml',
-            '--log-dir' : 'artifacts',
-            '--group' : 'BREAKOUT_RANDOM_EXPERT_02_10_2026',
+            'data_config' : 'afr/data_configs/debug.yaml',
+            'log_dir' : 'artifacts',
+            'group' : 'test',
         }
     ]
 

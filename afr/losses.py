@@ -200,7 +200,7 @@ def state_decoder_loss(
         encoder: The encoder network (gradients will NOT flow through if detach_encoder=True).
         state_decoder: The StateDecoderHead to train.
         trajectory_batch: Batch of trajectories (observations, masks).
-        normalized_states: Ground-truth normalized states, shape (B, L, state_dim).
+        normalized_states: Ground-truth normalized states, shape (B, L, normalized_state_dim).
         device: Device to run on.
         detach_encoder: If True, detach the representation so gradients do not
                         flow back to the encoder. Defaults to True.
@@ -222,7 +222,7 @@ def state_decoder_loss(
     # Flatten to (B*L, *obs_shape)
     obs_flat = observations.reshape(-1, *observations.shape[2:])
     masks_flat = masks.reshape(-1)  # (B*L,)
-    states_flat = normalized_states.reshape(-1, normalized_states.shape[-1]).to(device)  # (B*L, state_dim)
+    states_flat = normalized_states.reshape(-1, normalized_states.shape[-1]).to(device)  # (B*L, normalized_state_dim)
 
     obs_flat = normalize_pixel_obs(obs_flat.to(device))
     masks_flat = masks_flat.to(device)
@@ -233,7 +233,7 @@ def state_decoder_loss(
         embedding_flat = embedding_flat.detach()
 
     # Decode to state
-    state_pred_flat = state_decoder(embedding_flat)  # (B*L, state_dim)
+    state_pred_flat = state_decoder(embedding_flat)  # (B*L, normalized_state_dim)
 
     # MSE only on valid timesteps
     diff = (state_pred_flat - states_flat) * masks_flat.unsqueeze(-1)
@@ -263,7 +263,7 @@ def state_classifier_loss(
 
     Args:
         state_classifier: The StateClassifier to train.
-        normalized_states: Ground-truth normalized states, shape (B, L, state_dim).
+        normalized_states: Ground-truth normalized states, shape (B, L, normalized_state_dim).
         source_ids: Source ID per trajectory, shape (B,).
         device: Device to run on.
 
@@ -275,7 +275,7 @@ def state_classifier_loss(
     if isinstance(source_ids, np.ndarray):
         source_ids = torch.from_numpy(source_ids)
 
-    # Use state at t=0: (B, state_dim)
+    # Use state at t=0: (B, normalized_state_dim)
     state_t0 = normalized_states[:, 0].to(device).float()
     labels = source_ids.long().to(device)
 
