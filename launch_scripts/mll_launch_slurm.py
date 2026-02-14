@@ -91,32 +91,32 @@ if __name__ == "__main__":
 
 
     ########################## TRAIN SETTINGS #################################
-    script = 'python -m afr.pretrain_encoder'
-    sweep_configs = [
-        {
-            'data_config' : 'afr/data_configs/debug.yaml',
-            'log_dir' : 'artifacts',
-            'group' : 'test',
-        }
-    ]
+    # script = 'python -m afr.pretrain_encoder'
+    # sweep_configs = [
+    #     {
+    #         'data_config' : ['afr/data_configs/breakout_big.yaml', 'afr/data_configs/seaquest_big.yaml',],
+    #         'log_dir' : 'artifacts',
+    #         'group' : 'BIG_PRETRAIN_02_13_2026',
+    #     }
+    # ]
 
     ########################## EVAL SETTINGS #################################
 
-    # script = 'python -m afr.train_with_pretrained_encoder'
+    script = 'python -m afr.train_with_pretrained_encoder'
     
-    # # weights = ['artifacts/BreakoutNoFrameskip-v4/20260204_223530/encoder_final.pt', 'null']
-    # weights = ['artifacts/BreakoutNoFrameskip-v4/20260204_223530/encoder_final.pt']
-    # seeds = [0, 1, 2, 3, 4]
-    # freeze_encoders = [False]
-    # sweep_configs = [
-    #     {
-    #         '--data-config' : 'afr/data_configs/breakout_post.yaml',
-    #         '--log-dir' : 'artifacts/offline_rl',
-    #         '--seed' : seeds,
-    #         # '--encoder-weights' : weights,
-    #         '--group' : 'BREAKOUT_POST_EXPERT_02_04_2026',   
-    #         '--eval-interval': 500000,
-    #     }
-    # ]
+
+    weights = ['/u/mrudolph/documents/d3rlpy/artifacts/BIG_PRETRAIN_02_13_2026/SeaquestNoFrameskip-v4/20260213_143936/encoder_final.pt', 'null']
+    seeds = [0, 1, 2, 3, 4]
+    sweep_configs = [
+        {
+            '--data-config' : 'afr/data_configs/seaquest_post.yaml',
+            '--log-dir' : 'artifacts/offline_rl',
+            '--seed' : seeds,
+            '--encoder-weights' : weights,
+            '--group' : 'BIG_PRETRAIN',   
+            '--freeze-encoder' : True,
+            '--eval-interval': 500000,
+        }
+    ]
         
     main(args.dry_run, sweep_configs, script)

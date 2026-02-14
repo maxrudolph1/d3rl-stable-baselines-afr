@@ -27,11 +27,11 @@ data:
   #   label: 4
   # - path: "atari_data/resets/SeaquestNoFrameskip-v4/dqn/ckpt_5_100000.pth"
   #   label: 5
-  - path: "atari_data/resets/SeaquestNoFrameskip-v4/dqn/ckpt_6_100000.pth"
+  - path: "atari_data/resets/SeaquestNoFrameskip-v4/dqn/ckpt_6_500000.pth"
     label: 6
-  - path: "atari_data/resets/SeaquestNoFrameskip-v4/dqn/ckpt_7_100000.pth"
+  - path: "atari_data/resets/SeaquestNoFrameskip-v4/dqn/ckpt_7_500000.pth"
     label: 7
-  - path: "atari_data/resets/SeaquestNoFrameskip-v4/dqn/ckpt_8_100000.pth"
+  - path: "atari_data/resets/SeaquestNoFrameskip-v4/dqn/ckpt_8_500000.pth"
     label: 8
 
 validation_data:

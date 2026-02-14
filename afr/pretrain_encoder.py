@@ -30,6 +30,7 @@ from afr.extended_dataset import CombinedMDPDataset
 from afr.losses import cardpol_loss
 from afr.pretrainer import EncoderPretrainConfig, EncoderPretrainer
 from afr.utils import make_atari_env
+from afr.networks import get_encoder_factory
 
 
 def main():
@@ -91,6 +92,7 @@ def main():
     labels = [str(l) for l in data_config.data_labels]
     val_labels = [str(l) for l in data_config.validation_data_labels]
     env_id = data_config.environment
+    num_actions = data_config.num_actions
     normalized_state_dim = getattr(
         data_config, "normalized_state_dim", getattr(data_config, "state_dim", None)
     )
@@ -202,18 +204,24 @@ def main():
         wandb_run_name=f"cardpol_{args.group}_{env_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         wandb_tags=["cardpol", "encoder_pretrain", env_id],
         normalized_state_dim=normalized_state_dim,
+        num_actions=num_actions,
     )
     
     # Create CQL model
     print("Creating CQL model...")
+    
+    encoder_factory = get_encoder_factory(output_size=64)
+    
     cql = d3rlpy.algos.DiscreteCQLConfig(
         observation_scaler=PixelObservationScaler(),
         reward_scaler=ClipRewardScaler(-1.0, 1.0),
         compile_graph=False,
+        encoder_factory=encoder_factory,
     ).create(device=config.device)
 
     # Build the model with one of the datasets
     cql.build_with_dataset(datasets[0])
+     
     print("CQL model built.")
     
     # Create validation dataset

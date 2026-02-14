@@ -30,6 +30,7 @@ from d3rlpy.logging import FileAdapterFactory
 from afr.config import load_data_config
 from afr.pretrainer import load_pretrained_encoder_to_cql
 from afr.utils import make_atari_env
+from afr.networks import get_encoder_factory
 
 
 def load_dataset_from_path(data_path: str, env) -> d3rlpy.dataset.MDPDataset:
@@ -88,7 +89,7 @@ def main():
     parser.add_argument(
         "--n-steps",
         type=int,
-        default=10000000,
+        default=1000000,
         help="Number of training steps.",
     )
     parser.add_argument(
@@ -179,16 +180,20 @@ def main():
         dataset = datasets[0]
 
     print(f"\nDataset: {len(dataset.episodes)} episodes")
+    
+    
 
     d3rlpy.seed(args.seed)
     d3rlpy.envs.seed_env(env, args.seed)
 
     # Create CQL model
     print("\nCreating CQL model...")
+    encoder_factory = get_encoder_factory(output_size=64)
     cql = d3rlpy.algos.DiscreteCQLConfig(
         observation_scaler=PixelObservationScaler(),
         reward_scaler=ClipRewardScaler(-1.0, 1.0),
         compile_graph=False,
+        encoder_factory=encoder_factory,
     ).create(device=args.device)
 
     # Build the model with the dataset
@@ -217,7 +222,11 @@ def main():
     from datetime import datetime
     import random
     import string
-    rand_tag = ''.join(random.choices(string.ascii_letters, k=4))
+    # Make the random tag much less likely to collide by including more entropy
+    # Use time, process id, and extra random characters
+    import socket
+    job_id = os.environ.get('SLURM_JOB_ID', 'no_job_id')
+    rand_tag = ( ''.join(random.choices(string.ascii_letters + string.digits, k=6)) + f"_{os.getpid()}_{job_id}")
     time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     unique_tag = f"{time_stamp}_{rand_tag}"
     if args.group is not None:

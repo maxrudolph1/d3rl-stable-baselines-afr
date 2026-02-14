@@ -7,7 +7,14 @@ trajectory) and predicts which source policy generated the trajectory.
 
 import torch
 import torch.nn as nn
+import d3rlpy
 
+def get_encoder_factory(output_size: int = 64):
+    return d3rlpy.models.encoders.PixelEncoderFactory(
+        filters=[[16, 8, 4], [32, 4, 2], [64, 3, 1]],  # fewer channels
+        feature_size=output_size,
+    )
+    
 
 class CARDPOLClassifier(nn.Module):
     """
@@ -238,6 +245,71 @@ class StateDecoderHead(nn.Module):
             Predicted normalized state, shape (batch_size, normalized_state_dim).
         """
         return self.network(embedding)
+
+
+class CNNImageDecoder(nn.Module):
+    """
+    CNN decoder that reconstructs the first channel of an image from encoder representation.
+
+    Takes a representation (embedding) from the encoder and outputs a single-channel image
+    matching the spatial size of the first channel of the input. For 4-channel Atari inputs,
+    this predicts channel 0 only.
+
+    Mirrors the downsampling of the Nature DQN encoder: 84x84 -> 20x20 -> 9x9 -> 7x7.
+    Uses transposed convolutions to upsample: 7x7 -> 14x14 -> 28x28 -> 84x84.
+
+    Args:
+        embedding_size: Size of the embedding from the encoder.
+        observation_shape: (C, H, W) of the input observations. Output will be (1, H, W).
+    """
+
+    def __init__(
+        self,
+        embedding_size: int,
+        observation_shape: tuple,
+    ):
+        super().__init__()
+        self.embedding_size = embedding_size
+        self.observation_shape = observation_shape
+        _, h, w = observation_shape
+
+        # Encoder downsamples: 84->20->9->7 for default Nature DQN. Compute latent spatial size.
+        latent_h, latent_w = 7, 7  # Nature DQN output
+        latent_channels = 64
+
+        self.linear = nn.Linear(embedding_size, latent_channels * latent_h * latent_w)
+
+        # Transposed convs: 7->14->28->84 (for 84x84) or adapt for other sizes
+        self.deconv = nn.Sequential(
+            nn.ConvTranspose2d(latent_channels, 64, 4, 2, 1),  # 7 -> 14
+            nn.ReLU(),
+            nn.ConvTranspose2d(64, 32, 4, 2, 1),  # 14 -> 28
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, 1, 4, 2, 1),  # 28 -> 56
+        )
+        # Interpolate to final spatial size (e.g. 84x84 for Atari)
+        self._target_h, self._target_w = h, w
+        self._needs_resize = h != 56 or w != 56
+
+    def forward(self, embedding: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+
+        Args:
+            embedding: Embedding from encoder, shape (batch_size, embedding_size).
+
+        Returns:
+            Reconstructed first channel, shape (batch_size, 1, H, W). Values in [-1, 1].
+        """
+        x = self.linear(embedding)
+        x = x.view(x.shape[0], 64, 7, 7)
+        x = self.deconv(x)
+        if self._needs_resize:
+            x = torch.nn.functional.interpolate(
+                x, size=(self._target_h, self._target_w),
+                mode="bilinear", align_corners=False
+            )
+        return torch.tanh(x)
 
 
 class StateClassifier(nn.Module):

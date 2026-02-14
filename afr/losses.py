@@ -8,7 +8,7 @@ import torch.nn as nn
 
 from d3rlpy.dataset import TrajectoryMiniBatch
 
-from afr.classifier import CARDPOLClassifier, BehaviorCloningHead, StateDecoderHead, StateClassifier
+from afr.networks import CARDPOLClassifier, BehaviorCloningHead, StateDecoderHead, StateClassifier, CNNImageDecoder
 
 
 def normalize_pixel_obs(obs: torch.Tensor) -> torch.Tensor:
@@ -161,11 +161,11 @@ def bc_loss(
         embedding_t0 = embedding_t0.detach()
 
     # Get action prediction from BC head
+    
     logits = bc_head(embedding_t0)  # (batch, num_actions)
 
     # Compute cross-entropy loss
     loss = nn.functional.cross_entropy(logits, action_t0)
-
     # Compute accuracy for logging
     with torch.no_grad():
         predictions = torch.argmax(logits, dim=-1)
@@ -245,6 +245,74 @@ def state_decoder_loss(
 
     metrics = {
         "state_decoder_mae": mae.item(),
+    }
+    return loss, metrics
+
+
+def image_decoder_loss(
+    encoder: nn.Module,
+    image_decoder: CNNImageDecoder,
+    trajectory_batch: TrajectoryMiniBatch,
+    device: str = "cuda:0",
+    detach_encoder: bool = True,
+) -> tuple:
+    """
+    Image decoder loss: reconstruct first channel of observation from encoder representation.
+
+    For each observation, encode it, then decode the representation to the first channel.
+    Uses MSE loss. Predicts channel 0 only (e.g. for 4-channel stacked frames).
+
+    IMPORTANT: By default, gradients do NOT backpropagate through the encoder.
+
+    Args:
+        encoder: The encoder network (gradients will NOT flow through if detach_encoder=True).
+        image_decoder: The CNNImageDecoder to train.
+        trajectory_batch: Batch of trajectories (observations, masks).
+        device: Device to run on.
+        detach_encoder: If True, detach the representation so gradients do not
+                        flow back to the encoder. Defaults to True.
+
+    Returns:
+        Tuple of (loss, metrics_dict).
+    """
+    observations = trajectory_batch.observations  # (B, L, C, H, W)
+    masks = trajectory_batch.masks  # (B, L)
+
+    if isinstance(observations, np.ndarray):
+        observations = torch.from_numpy(observations)
+    if isinstance(masks, np.ndarray):
+        masks = torch.from_numpy(masks)
+
+    # Flatten to (B*L, C, H, W)
+    obs_flat = observations.reshape(-1, *observations.shape[2:])
+    masks_flat = masks.reshape(-1)  # (B*L,)
+
+    obs_flat = normalize_pixel_obs(obs_flat.to(device))
+    masks_flat = masks_flat.to(device)
+
+    # Target: first channel only, shape (B*L, 1, H, W)
+    target_first_channel = obs_flat[:, :1]  # (B*L, 1, H, W)
+
+    # Encode all observations
+    embedding_flat = encoder(obs_flat)
+    if detach_encoder:
+        embedding_flat = embedding_flat.detach()
+
+    # Decode to image
+    pred_first_channel = image_decoder(embedding_flat)  # (B*L, 1, H, W)
+
+    # MSE only on valid timesteps
+    diff = (pred_first_channel - target_first_channel) * masks_flat.view(-1, 1, 1, 1)
+    n_pixels_per_frame = pred_first_channel.shape[1] * pred_first_channel.shape[2] * pred_first_channel.shape[3]
+    n_valid_pixels = masks_flat.sum() * n_pixels_per_frame + 1e-8
+    loss = (diff ** 2).sum() / n_valid_pixels
+
+    with torch.no_grad():
+        mae_per_frame = diff.abs().mean(dim=(1, 2, 3)) * masks_flat
+        mae = mae_per_frame.sum() / (masks_flat.sum() + 1e-8)
+
+    metrics = {
+        "image_decoder_mae": mae.item(),
     }
     return loss, metrics
 

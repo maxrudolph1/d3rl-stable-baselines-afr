@@ -24,9 +24,9 @@ except ImportError:
 
 import d3rlpy
 
-from afr.classifier import CARDPOLClassifier, BehaviorCloningHead, StateDecoderHead, StateClassifier
+from afr.networks import CARDPOLClassifier, BehaviorCloningHead, StateDecoderHead, StateClassifier, CNNImageDecoder
 from afr.extended_dataset import CombinedMDPDataset, TrajectoryBatchWithSource
-from afr.losses import cardpol_loss, bc_loss, state_decoder_loss, state_classifier_loss, normalize_pixel_obs
+from afr.losses import cardpol_loss, bc_loss, state_decoder_loss, state_classifier_loss, image_decoder_loss, normalize_pixel_obs
 
 
 class EncoderPretrainer:
@@ -59,6 +59,7 @@ class EncoderPretrainer:
         bc_head: Optional[BehaviorCloningHead] = None,
         state_decoder: Optional[StateDecoderHead] = None,
         state_classifier: Optional[StateClassifier] = None,
+        image_decoder: Optional[CNNImageDecoder] = None,
         val_combined_dataset: Optional[CombinedMDPDataset] = None,
     ):
         """
@@ -77,6 +78,8 @@ class EncoderPretrainer:
                     If None and config.use_state_decoder=True, one will be created.
             state_classifier: Optional pre-initialized StateClassifier.
                     If None and config.use_state_classifier=True, one will be created.
+            image_decoder: Optional pre-initialized CNNImageDecoder.
+                    If None and config.use_image_decoder=True, one will be created.
             val_combined_dataset: Optional validation CombinedMDPDataset for
                                   evaluating classifier accuracy during training.
         """
@@ -154,6 +157,23 @@ class EncoderPretrainer:
                 lr=config.state_classifier_learning_rate,
             )
 
+        # Create or use provided image decoder (if enabled)
+        self.image_decoder = None
+        self.image_decoder_optimizer = None
+        if config.use_image_decoder:
+            obs_shape = tuple(self.cql._impl.observation_shape)
+            if image_decoder is not None:
+                self.image_decoder = image_decoder.to(self.device)
+            else:
+                self.image_decoder = CNNImageDecoder(
+                    embedding_size=encoder_feature_size,
+                    observation_shape=obs_shape,
+                ).to(self.device)
+            self.image_decoder_optimizer = optim.Adam(
+                self.image_decoder.parameters(),
+                lr=config.image_decoder_learning_rate,
+            )
+
         # Set up optimizer for encoder parameters
         encoder_params = []
         for encoder in self.encoders:
@@ -206,6 +226,9 @@ class EncoderPretrainer:
                 "use_state_classifier": config.use_state_classifier,
                 "state_classifier_learning_rate": config.state_classifier_learning_rate,
                 "state_classifier_loss_weight": config.state_classifier_loss_weight,
+                "use_image_decoder": config.use_image_decoder,
+                "image_decoder_learning_rate": config.image_decoder_learning_rate,
+                "image_decoder_loss_weight": config.image_decoder_loss_weight,
                 "group": config.group,
             }
             wandb.init(
@@ -224,6 +247,8 @@ class EncoderPretrainer:
                 wandb.watch(self.state_decoder, log="gradients", log_freq=config.log_interval)
             if self.state_classifier is not None:
                 wandb.watch(self.state_classifier, log="gradients", log_freq=config.log_interval)
+            if self.image_decoder is not None:
+                wandb.watch(self.image_decoder, log="gradients", log_freq=config.log_interval)
 
     def _compute_encoder_feature_size(self) -> int:
         """Compute the output feature size of the encoder."""
@@ -288,6 +313,8 @@ class EncoderPretrainer:
             self.state_decoder.train()
         if self.state_classifier is not None:
             self.state_classifier.train()
+        if self.image_decoder is not None:
+            self.image_decoder.train()
 
         # Use the first encoder for the loss (they share the same architecture)
         cardpol_loss_val, metrics = self.loss_fn(
@@ -371,6 +398,21 @@ class EncoderPretrainer:
             all_metrics["state_classifier_loss"] = state_classifier_loss_val.item()
             all_metrics.update(state_classifier_metrics)
 
+        # Image decoder loss: reconstruct first channel from representation (no grad through encoder)
+        if self.image_decoder is not None:
+            image_decoder_loss_val, image_decoder_metrics = image_decoder_loss(
+                encoder=self.encoders[0],
+                image_decoder=self.image_decoder,
+                trajectory_batch=trajectory_batch,
+                device=self.device,
+                detach_encoder=True,
+            )
+            self.image_decoder_optimizer.zero_grad()
+            image_decoder_loss_val.backward()
+            self.image_decoder_optimizer.step()
+            all_metrics["image_decoder_loss"] = image_decoder_loss_val.item()
+            all_metrics.update(image_decoder_metrics)
+
         # Compute total loss for logging (weighted sum)
         total_loss = cardpol_loss_val.item()
         if self.bc_head is not None:
@@ -379,6 +421,8 @@ class EncoderPretrainer:
             total_loss += self.config.state_decoder_loss_weight * all_metrics["state_decoder_loss"]
         if self.state_classifier is not None and "state_classifier_loss" in all_metrics:
             total_loss += self.config.state_classifier_loss_weight * all_metrics["state_classifier_loss"]
+        if self.image_decoder is not None and "image_decoder_loss" in all_metrics:
+            total_loss += self.config.image_decoder_loss_weight * all_metrics["image_decoder_loss"]
         all_metrics["loss"] = total_loss
 
         return all_metrics
@@ -404,6 +448,8 @@ class EncoderPretrainer:
             self.state_decoder.eval()
         if self.state_classifier is not None:
             self.state_classifier.eval()
+        if self.image_decoder is not None:
+            self.image_decoder.eval()
 
         total_loss = 0.0
         total_correct = 0
@@ -419,6 +465,10 @@ class EncoderPretrainer:
         # State decoder validation metrics
         state_decoder_total_mae = 0.0
         state_decoder_n_batches = 0
+
+        # Image decoder validation metrics
+        image_decoder_total_mae = 0.0
+        image_decoder_n_batches = 0
 
         # State classifier validation metrics
         state_classifier_total_correct = 0
@@ -502,6 +552,18 @@ class EncoderPretrainer:
                 state_decoder_total_mae += state_decoder_metrics["state_decoder_mae"]
                 state_decoder_n_batches += 1
 
+            # Image decoder validation
+            if self.image_decoder is not None:
+                _, image_decoder_metrics = image_decoder_loss(
+                    encoder=self.encoders[0],
+                    image_decoder=self.image_decoder,
+                    trajectory_batch=trajectory_batch,
+                    device=self.device,
+                    detach_encoder=True,
+                )
+                image_decoder_total_mae += image_decoder_metrics["image_decoder_mae"]
+                image_decoder_n_batches += 1
+
             # State classifier validation when batch has normalized_states
             if (
                 self.state_classifier is not None
@@ -530,6 +592,8 @@ class EncoderPretrainer:
             self.state_decoder.train()
         if self.state_classifier is not None:
             self.state_classifier.train()
+        if self.image_decoder is not None:
+            self.image_decoder.train()
 
         if total_samples == 0:
             return {"val_accuracy": 0.0, "val_loss": 0.0}
@@ -560,6 +624,12 @@ class EncoderPretrainer:
                 state_decoder_total_mae / state_decoder_n_batches
             )
 
+        # Add image decoder validation metrics
+        if self.image_decoder is not None and image_decoder_n_batches > 0:
+            val_metrics["val_image_decoder_mae"] = (
+                image_decoder_total_mae / image_decoder_n_batches
+            )
+
         # Add state classifier validation metrics
         if self.state_classifier is not None and state_classifier_total_samples > 0:
             val_metrics["val_state_classifier_accuracy"] = (
@@ -567,6 +637,40 @@ class EncoderPretrainer:
             )
 
         return val_metrics
+
+    @torch.no_grad()
+    def _log_image_decoder_samples(self, step: int, n_samples: int = 8) -> None:
+        """Sample a batch, run encoder+decoder, and log input/output images to wandb."""
+        if not WANDB_AVAILABLE or not self.use_wandb:
+            return
+        batch_with_source = self.combined_dataset.sample_trajectory_batch(
+            batch_size=n_samples, length=1
+        )
+        trajectory_batch = batch_with_source.batch
+        observations = trajectory_batch.observations  # (B, 1, C, H, W)
+        if isinstance(observations, np.ndarray):
+            observations = torch.from_numpy(observations)
+        obs = observations[:, 0].to(self.device)  # (B, C, H, W)
+        obs_norm = normalize_pixel_obs(obs)
+        embedding = self.encoders[0](obs_norm)
+        pred = self.image_decoder(embedding)  # (B, 1, H, W), values in [-1, 1]
+
+        # Target: first channel of input (normalized)
+        target = obs_norm[:, :1]  # (B, 1, H, W)
+
+        # Convert to [0, 255] for wandb display: (x + 1) * 127.5
+        def to_uint8(x: torch.Tensor) -> np.ndarray:
+            return ((x.cpu().numpy() + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
+
+        input_imgs = to_uint8(target)  # (B, 1, H, W)
+        output_imgs = to_uint8(pred)  # (B, 1, H, W)
+        # wandb.Image expects (H, W) or (H, W, C) for grayscale
+        table = wandb.Table(columns=["Input (first channel)", "Output (reconstructed)"])
+        for i in range(min(n_samples, input_imgs.shape[0])):
+            inp = input_imgs[i, 0]  # (H, W)
+            out = output_imgs[i, 0]  # (H, W)
+            table.add_data(wandb.Image(inp), wandb.Image(out))
+        wandb.log({"image_decoder/input_vs_output": table}, step=step)
 
     def pretrain(self) -> None:
         """Run the full pre-training loop."""
@@ -589,6 +693,9 @@ class EncoderPretrainer:
             print(f"  NOTE: State decoder gradients do NOT backpropagate to encoder")
         if self.state_classifier is not None:
             print(f"State classifier enabled: normalized_state_dim={self.config.normalized_state_dim}, weight={self.config.state_classifier_loss_weight}")
+        if self.image_decoder is not None:
+            print(f"Image decoder enabled: predicts first channel, weight={self.config.image_decoder_loss_weight}, log every {self.config.image_decoder_log_interval} steps")
+            print(f"  NOTE: Image decoder gradients do NOT backpropagate to encoder")
         print("-" * 50)
 
         best_val_accuracy = 0.0
@@ -602,6 +709,14 @@ class EncoderPretrainer:
             # Log metrics to wandb
             if self.use_wandb:
                 wandb.log({f"train/{k}": v for k, v in metrics.items()}, step=step)
+
+                # Log input/output images from image decoder periodically
+                if (
+                    self.image_decoder is not None
+                    and self.config.image_decoder_log_interval > 0
+                    and step % self.config.image_decoder_log_interval == 0
+                ):
+                    self._log_image_decoder_samples(step)
 
             # Run validation
             if (self.config.val_interval > 0 and
@@ -674,6 +789,7 @@ class EncoderPretrainer:
         include_bc_head: bool = True,
         include_state_decoder: bool = True,
         include_state_classifier: bool = True,
+        include_image_decoder: bool = True,
     ) -> None:
         """
         Save encoder, classifier, BC head, state decoder, and state classifier weights to a file.
@@ -684,6 +800,7 @@ class EncoderPretrainer:
             include_bc_head: Whether to include BC head weights.
             include_state_decoder: Whether to include state decoder weights.
             include_state_classifier: Whether to include state classifier weights.
+            include_image_decoder: Whether to include image decoder weights.
         """
         state_dict = {}
         for i, encoder in enumerate(self.encoders):
@@ -718,6 +835,13 @@ class EncoderPretrainer:
                 "num_sources": self.state_classifier.num_sources,
             }
 
+        if include_image_decoder and self.image_decoder is not None:
+            state_dict["image_decoder"] = self.image_decoder.state_dict()
+            state_dict["image_decoder_config"] = {
+                "embedding_size": self.image_decoder.embedding_size,
+                "observation_shape": self.image_decoder.observation_shape,
+            }
+
         torch.save(state_dict, path)
         print(f"Saved encoder weights to {path}")
 
@@ -728,6 +852,7 @@ class EncoderPretrainer:
         load_bc_head: bool = True,
         load_state_decoder: bool = True,
         load_state_classifier: bool = True,
+        load_image_decoder: bool = True,
     ) -> None:
         """
         Load encoder, classifier, BC head, state decoder, and state classifier weights from a file.
@@ -738,6 +863,7 @@ class EncoderPretrainer:
             load_bc_head: Whether to load BC head weights.
             load_state_decoder: Whether to load state decoder weights.
             load_state_classifier: Whether to load state classifier weights.
+            load_image_decoder: Whether to load image decoder weights.
         """
         state_dict = torch.load(path, map_location=self.device)
         for i, encoder in enumerate(self.encoders):
@@ -760,6 +886,10 @@ class EncoderPretrainer:
         if load_state_classifier and "state_classifier" in state_dict and self.state_classifier is not None:
             self.state_classifier.load_state_dict(state_dict["state_classifier"])
             loaded_components.append("state_classifier")
+
+        if load_image_decoder and "image_decoder" in state_dict and self.image_decoder is not None:
+            self.image_decoder.load_state_dict(state_dict["image_decoder"])
+            loaded_components.append("image_decoder")
 
         print(f"Loaded {', '.join(loaded_components)} weights from {path}")
 

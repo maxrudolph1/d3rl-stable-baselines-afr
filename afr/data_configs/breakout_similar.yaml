@@ -11,17 +11,20 @@
 #   - A string (path only; label defaults to index)
 
 environment: "BreakoutNoFrameskip-v4"
-# Dimension of normalized_state (after filtering low-variance columns); state is always 128.
-normalized_state_dim: 128
 
+normalized_state_dim: 128
 data:
-  - path: "atari_data/atari_data_with_state/BreakoutNoFrameskip-v4/dqn/ckpt_0_10000_with_state.pth"
-    label: 0
-  - path: "atari_data/atari_data_with_state/BreakoutNoFrameskip-v4/dqn/ckpt_7_10000_with_state.pth"
+  - path: "atari_data/resets/BreakoutNoFrameskip-v4/dqn/ckpt_7_100000.pth"
     label: 1
+  - path: "atari_data/resets/BreakoutNoFrameskip-v4/dqn/ckpt_8_100000.pth"
+    label: 2
+  - path: "atari_data/resets/BreakoutNoFrameskip-v4/dqn/ckpt_9_100000.pth"
+    label: 3
 
 validation_data:
-  - path: "atari_data/atari_data_with_state/BreakoutNoFrameskip-v4/dqn/ckpt_0_10000_with_state.pth"
-    label: 0
-  - path: "atari_data/atari_data_with_state/BreakoutNoFrameskip-v4/dqn/ckpt_7_10000_with_state.pth"
+  - path: "atari_data/resets/BreakoutNoFrameskip-v4/dqn/ckpt_7_10000.pth"
     label: 1
+  - path: "atari_data/resets/BreakoutNoFrameskip-v4/dqn/ckpt_8_10000.pth"
+    label: 2
+  - path: "atari_data/resets/BreakoutNoFrameskip-v4/dqn/ckpt_9_10000.pth"
+    label: 3

@@ -28,11 +28,11 @@ data:
   #   label: 5
   # - path: "atari_data/resets/BreakoutNoFrameskip-v4/dqn/ckpt_6_100000.pth"
   #   label: 6
-  - path: "atari_data/resets/BreakoutNoFrameskip-v4/dqn/ckpt_7_100000.pth"
+  - path: "atari_data/resets/BreakoutNoFrameskip-v4/dqn/ckpt_7_500000.pth"
     label: 7
-  - path: "atari_data/resets/BreakoutNoFrameskip-v4/dqn/ckpt_8_100000.pth"
+  - path: "atari_data/resets/BreakoutNoFrameskip-v4/dqn/ckpt_8_500000.pth"
     label: 8
-  - path: "atari_data/resets/BreakoutNoFrameskip-v4/dqn/ckpt_9_100000.pth"
+  - path: "atari_data/resets/BreakoutNoFrameskip-v4/dqn/ckpt_9_500000.pth"
     label: 9
 
 validation_data:

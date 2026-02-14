@@ -34,6 +34,7 @@ class DataConfig:
     validation_data_paths: List[str]
     validation_data_labels: List[Union[int, str]]
     normalized_state_dim: int | None = None  # From data YAML; dimension of normalized_state after filtering.
+    num_actions: int | None = None  # Number of discrete actions (required if use_bc_head=True)
     
 @dataclass
 class EncoderPretrainConfig:
@@ -43,7 +44,7 @@ class EncoderPretrainConfig:
     learning_rate: float = 1e-4
     classifier_learning_rate: float = 1e-4
     batch_size: int = 512
-    trajectory_length: int = 10
+    trajectory_length: int = 3
     n_steps: int = 100000
 
     # Classifier configuration
@@ -56,7 +57,7 @@ class EncoderPretrainConfig:
     bc_learning_rate: float = 1e-3
     bc_hidden_sizes: list = None  # Default: [256, 128]
     bc_loss_weight: float = 1.0  # Weight for BC loss relative to CARDPOL loss
-    num_actions: int = 4  # Number of discrete actions (required if use_bc_head=True)
+    num_actions: int = None  # Number of discrete actions (required if use_bc_head=True)
 
     # State decoder head configuration (decodes normalized_state from representation; no grad through encoder)
     use_state_decoder: bool = True  # Whether to train a state decoder when datasets have normalized_state
@@ -70,6 +71,12 @@ class EncoderPretrainConfig:
     state_classifier_learning_rate: float = 1e-3
     state_classifier_hidden_sizes: list = None  # Default: [256, 128]
     state_classifier_loss_weight: float = 1.0  # Weight for state classifier cross-entropy loss
+
+    # CNN image decoder configuration (reconstructs first channel from representation; no grad through encoder)
+    use_image_decoder: bool = True  # Whether to train a CNN decoder that predicts first channel from representation
+    image_decoder_learning_rate: float = 1e-3
+    image_decoder_loss_weight: float = 1.0  # Weight for image decoder MSE loss
+    image_decoder_log_interval: int = 500  # How often to log input/output images to wandb (0 to disable)
 
     # Logging
     log_interval: int = 100
@@ -85,7 +92,7 @@ class EncoderPretrainConfig:
     wandb_tags: list = None  # Optional tags for the run
 
     # Validation
-    val_interval: int = 500  # How often to run validation (0 to disable)
+    val_interval: int = 100  # How often to run validation (0 to disable)
     val_batch_size: int = 64  # Batch size for validation
     val_n_batches: int = 10  # Number of batches to use for validation
 
@@ -182,7 +189,7 @@ def load_data_config(config_path: Union[str, Path]) -> DataConfig:
     validation_data_paths, validation_data_labels = parse_entries("validation_data")
     # Prefer normalized_state_dim; fall back to state_dim for backwards compatibility.
     normalized_state_dim = raw.get("normalized_state_dim", raw.get("state_dim", None))
-
+    num_actions = raw.get("num_actions", None)
     return DataConfig(
         environment=environment,
         data_paths=data_paths,
@@ -190,4 +197,5 @@ def load_data_config(config_path: Union[str, Path]) -> DataConfig:
         validation_data_paths=validation_data_paths,
         validation_data_labels=validation_data_labels,
         normalized_state_dim=normalized_state_dim,
+        num_actions=num_actions,
     )

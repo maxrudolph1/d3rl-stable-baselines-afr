@@ -13,9 +13,9 @@
 environment: "BreakoutNoFrameskip-v4"
 
 data:
-  - path: "atari_data/BreakoutNoFrameskip-v4/dqn/ckpt_9_100000.pth"
+  - path: "atari_data/resets/BreakoutNoFrameskip-v4/dqn/ckpt_9_100000.pth"
     label: 0
 
 validation_data:
-  - path: "atari_data/BreakoutNoFrameskip-v4/dqn/ckpt_9_10000.pth"
+  - path: "atari_data/resets/BreakoutNoFrameskip-v4/dqn/ckpt_9_10000.pth"
     label: 0

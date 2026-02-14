@@ -24,11 +24,11 @@ data:
   #   label: 3
   # - path: "atari_data/resets/QbertNoFrameskip-v4/dqn/ckpt_4_100000.pth"
   #   label: 4
-  - path: "atari_data/resets/QbertNoFrameskip-v4/dqn/ckpt_5_100000.pth"
+  - path: "atari_data/resets/QbertNoFrameskip-v4/dqn/ckpt_5_1000000.pth"
     label: 5
-  - path: "atari_data/resets/QbertNoFrameskip-v4/dqn/ckpt_6_100000.pth"
+  - path: "atari_data/resets/QbertNoFrameskip-v4/dqn/ckpt_6_1000000.pth"
     label: 6
-  - path: "atari_data/resets/QbertNoFrameskip-v4/dqn/ckpt_7_100000.pth"
+  - path: "atari_data/resets/QbertNoFrameskip-v4/dqn/ckpt_7_1000000.pth"
     label: 7
 
 validation_data:

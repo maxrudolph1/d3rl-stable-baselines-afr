@@ -13,21 +13,21 @@
 environment: "PongNoFrameskip-v4"
 
 data:
-  - path: "atari_data/PongNoFrameskip-v4/dqn/ckpt_0_100000.pth"
+  - path: "atari_data/resets/PongNoFrameskip-v4/dqn/ckpt_0_100000.pth"
     label: 0
-  - path: "atari_data/PongNoFrameskip-v4/dqn/ckpt_1_100000.pth"
+  - path: "atari_data/resets/PongNoFrameskip-v4/dqn/ckpt_1_100000.pth"
     label: 1
-  - path: "atari_data/PongNoFrameskip-v4/dqn/ckpt_2_100000.pth"
+  - path: "atari_data/resets/PongNoFrameskip-v4/dqn/ckpt_2_100000.pth"
     label: 2
-  - path: "atari_data/PongNoFrameskip-v4/dqn/ckpt_3_100000.pth"
+  - path: "atari_data/resets/PongNoFrameskip-v4/dqn/ckpt_3_100000.pth"
     label: 3
 
 validation_data:
-  - path: "atari_data/PongNoFrameskip-v4/dqn/ckpt_0_10000.pth"
+  - path: "atari_data/resets/PongNoFrameskip-v4/dqn/ckpt_0_10000.pth"
     label: 0
-  - path: "atari_data/PongNoFrameskip-v4/dqn/ckpt_1_10000.pth"
+  - path: "atari_data/resets/PongNoFrameskip-v4/dqn/ckpt_1_10000.pth"
     label: 1
-  - path: "atari_data/PongNoFrameskip-v4/dqn/ckpt_2_10000.pth"
+  - path: "atari_data/resets/PongNoFrameskip-v4/dqn/ckpt_2_10000.pth"
     label: 2
-  - path: "atari_data/PongNoFrameskip-v4/dqn/ckpt_3_10000.pth"
+  - path: "atari_data/resets/PongNoFrameskip-v4/dqn/ckpt_3_10000.pth"
     label: 3

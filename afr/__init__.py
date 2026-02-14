@@ -5,7 +5,7 @@ This package provides tools for encoder pre-training using CARDPOL
 (Contrastive Actor Recognition for Diverse POLicies).
 """
 
-from afr.classifier import CARDPOLClassifier
+from afr.networks import CARDPOLClassifier
 from afr.config import DataConfig, load_data_config
 from afr.extended_dataset import CombinedMDPDataset, TrajectoryBatchWithSource
 from afr.losses import cardpol_loss, normalize_pixel_obs

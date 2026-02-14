@@ -13,9 +13,9 @@
 environment: "SeaquestNoFrameskip-v4"
 
 data:
-  - path: "atari_data/SeaquestNoFrameskip-v4/dqn/ckpt_8_100000.pth"
+  - path: "atari_data/resets/SeaquestNoFrameskip-v4/dqn/ckpt_8_100000.pth"
     label: 8
 
 validation_data:
-  - path: "atari_data/SeaquestNoFrameskip-v4/dqn/ckpt_8_10000.pth"
+  - path: "atari_data/resets/SeaquestNoFrameskip-v4/dqn/ckpt_8_10000.pth"
     label: 8
