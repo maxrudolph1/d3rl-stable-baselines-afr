@@ -105,17 +105,17 @@ if __name__ == "__main__":
     script = 'python -m afr.train_with_pretrained_encoder'
     
 
-    weights = ['/u/mrudolph/documents/d3rlpy/artifacts/BIG_PRETRAIN_02_13_2026/SeaquestNoFrameskip-v4/20260213_143936/encoder_final.pt', 'null']
-    seeds = [0, 1, 2, 3, 4]
+    # weights = ['/u/mrudolph/documents/d3rlpy/artifacts/BIG_PRETRAIN_02_13_2026/SeaquestNoFrameskip-v4/20260213_143936/encoder_final.pt', 'null']
+    weights = ['/u/mrudolph/documents/d3rlpy/artifacts/BIG_PRETRAIN_02_13_2026/BreakoutNoFrameskip-v4/20260213_143937/encoder_final.pt', 'null']
+    seeds = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     sweep_configs = [
         {
-            '--data-config' : 'afr/data_configs/seaquest_post.yaml',
+            '--data-config' : 'afr/data_configs/breakout_post_small.yaml',
             '--log-dir' : 'artifacts/offline_rl',
             '--seed' : seeds,
             '--encoder-weights' : weights,
-            '--group' : 'BIG_PRETRAIN',   
-            '--freeze-encoder' : True,
-            '--eval-interval': 500000,
+            '--group' : 'BIG_PRETRAIN_SMALL_POST_TRAIN_02_14_2026',   
+            '--eval-interval': 100000,
         }
     ]
         

@@ -91,10 +91,28 @@ def load_game_runs(game_path: str | Path) -> pd.DataFrame:
     return pd.concat(dfs, ignore_index=True)
 
 
+def _short_label(col: str, val) -> str:
+    """Shorten legend label: strip args_ prefix, abbreviate booleans/null."""
+    name = col.replace("args_", "") if col.startswith("args_") else col
+    if val is None or (isinstance(val, str) and val.lower() in ("null", "none")):
+        v = "-"
+    elif val is True:
+        v = "T"
+    elif val is False:
+        v = "F"
+    else:
+        v = str(val)
+        if len(v) > 12:
+            v = v[:9] + "…"
+    return f"{name}={v}"
+
+
 def plot_step_vs_value(
     df: pd.DataFrame,
     group_by: str | list[str] | None = None,
     save_path: str | Path | None = None,
+    smooth: int | None = None,
+    show_all_runs: bool = False,
 ) -> None:
     """
     Plot step vs value: mean with ± std error shaded across runs.
@@ -105,8 +123,20 @@ def plot_step_vs_value(
             mean ± sem. E.g. "args_freeze_encoder" or ["args_freeze_encoder", "args_encoder_weights"].
             If None, all runs are aggregated into one line.
         save_path: Where to save the figure.
+        smooth: Temporal smoothing: exponential moving average span (number of points).
+            Applied per run before aggregating. E.g. 5 or 10.
+        show_all_runs: If True, plot each run as its own line (no aggregation), colored by group.
     """
     import matplotlib.pyplot as plt
+
+    if smooth is not None and smooth > 1:
+        run_col = "unique_tag" if "unique_tag" in df.columns else df.columns[0]
+        smoothed = []
+        for _, g in df.groupby(run_col):
+            g = g.sort_values("step").copy()
+            g["value"] = g["value"].ewm(span=smooth, adjust=False).mean()
+            smoothed.append(g)
+        df = pd.concat(smoothed, ignore_index=True)
 
     if group_by is not None:
         group_cols = [group_by] if isinstance(group_by, str) else list(group_by)
@@ -117,32 +147,58 @@ def plot_step_vs_value(
         group_cols = []
 
     fig, ax = plt.subplots()
-    # Only do grouped lines if group_cols is not empty and not None
-    if group_cols and len(group_cols) > 0:
-        # within this, only group if there's more than one group value or more than 1 group col
-        # e.g. don't do grouped legend/labels for a single unique value or single group
-        # (preserves original intent)
-        if (len(group_cols) == 1 and df[group_cols[0]].nunique() > 1) or (len(group_cols) > 1):
-            for keys, g in df.groupby(group_cols):
+
+    if show_all_runs:
+        # Plot each run as its own line, colored by group
+        run_col = "unique_tag" if "unique_tag" in df.columns else None
+        if run_col is None:
+            raise ValueError("show_all_runs requires unique_tag column")
+        cmap = plt.cm.get_cmap("tab10")
+        if group_cols:
+            groups = df.groupby(group_cols)
+            group_keys = list(groups.groups.keys())
+            colors = {g: cmap(i % 10) for i, g in enumerate(group_keys)}
+            for keys, g in groups:
                 keys_tuple = (keys,) if len(group_cols) == 1 else keys
-                label = ", ".join(f"{c}={v}" for c, v in zip(group_cols, keys_tuple))
-                agg = g.groupby("step")["value"].agg(["mean", "sem"]).reset_index()
-                step, mean, sem = agg["step"], agg["mean"], agg["sem"]
-                ax.plot(step, mean, label=label)
-                ax.fill_between(step, mean - sem, mean + sem, alpha=0.3)
-            ax.legend()
+                label = ", ".join(_short_label(c, v) for c, v in zip(group_cols, keys_tuple))
+                color = colors[keys]
+                for i, (_, run_df) in enumerate(g.groupby(run_col)):
+                    run_df = run_df.sort_values("step")
+                    ax.plot(
+                        run_df["step"], run_df["value"],
+                        color=color, alpha=0.6,
+                        label=label if i == 0 else None,
+                    )
+            # Avoid duplicate legend entries (each group adds label on first run only)
+            handles, labels = ax.get_legend_handles_labels()
+            by_label = dict(zip(labels, handles))
+            ax.legend(by_label.values(), by_label.keys(), fontsize="small")
         else:
-            # Single group, no need for legend
+            for _, run_df in df.groupby(run_col):
+                run_df = run_df.sort_values("step")
+                ax.plot(run_df["step"], run_df["value"], alpha=0.6)
+    else:
+        # Aggregated: mean ± sem
+        if group_cols and len(group_cols) > 0:
+            if (len(group_cols) == 1 and df[group_cols[0]].nunique() > 1) or (len(group_cols) > 1):
+                for keys, g in df.groupby(group_cols):
+                    keys_tuple = (keys,) if len(group_cols) == 1 else keys
+                    label = ", ".join(_short_label(c, v) for c, v in zip(group_cols, keys_tuple))
+                    agg = g.groupby("step")["value"].agg(["mean", "sem"]).reset_index()
+                    step, mean, sem = agg["step"], agg["mean"], agg["sem"]
+                    ax.plot(step, mean, label=label)
+                    ax.fill_between(step, mean - sem, mean + sem, alpha=0.3)
+                ax.legend(fontsize="small")
+            else:
+                agg = df.groupby("step")["value"].agg(["mean", "sem"]).reset_index()
+                step, mean, sem = agg["step"], agg["mean"], agg["sem"]
+                ax.plot(step, mean)
+                ax.fill_between(step, mean - sem, mean + sem, alpha=0.3)
+        else:
             agg = df.groupby("step")["value"].agg(["mean", "sem"]).reset_index()
             step, mean, sem = agg["step"], agg["mean"], agg["sem"]
             ax.plot(step, mean)
             ax.fill_between(step, mean - sem, mean + sem, alpha=0.3)
-    else:
-        # No group_by: aggregate all runs
-        agg = df.groupby("step")["value"].agg(["mean", "sem"]).reset_index()
-        step, mean, sem = agg["step"], agg["mean"], agg["sem"]
-        ax.plot(step, mean)
-        ax.fill_between(step, mean - sem, mean + sem, alpha=0.3)
 
     ax.set_xlabel("step")
     ax.set_ylabel("value")
@@ -178,6 +234,18 @@ if __name__ == "__main__":
         metavar="FILE",
         help="Output path for the figure. Default: figures/{group_id}_{game_name}.png",
     )
+    parser.add_argument(
+        "--smooth",
+        type=int,
+        default=None,
+        metavar="SPAN",
+        help="Temporal smoothing: exponential moving average span (e.g. 5 or 10). Applied per run.",
+    )
+    parser.add_argument(
+        "--show-all",
+        action="store_true",
+        help="Plot each run as its own line (no aggregation). Colored by --group-by when provided.",
+    )
     args = parser.parse_args()
 
     df = load_game_runs(args.path)
@@ -188,4 +256,10 @@ if __name__ == "__main__":
         group_id = path_parts[-2] if len(path_parts) >= 2 else "output"
         game_name = path_parts[-1] if path_parts else "plot"
         save_path = f"figures/{group_id}_{game_name}.png"
-    plot_step_vs_value(df, group_by=group_by, save_path=save_path)
+    plot_step_vs_value(
+        df,
+        group_by=group_by,
+        save_path=save_path,
+        smooth=args.smooth,
+        show_all_runs=args.show_all,
+    )

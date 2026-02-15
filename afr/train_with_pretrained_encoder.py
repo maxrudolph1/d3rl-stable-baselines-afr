@@ -89,7 +89,7 @@ def main():
     parser.add_argument(
         "--n-steps",
         type=int,
-        default=1000000,
+        default=5000000,
         help="Number of training steps.",
     )
     parser.add_argument(
