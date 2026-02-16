@@ -158,6 +158,7 @@ def plot_step_vs_value(
             groups = df.groupby(group_cols)
             group_keys = list(groups.groups.keys())
             colors = {g: cmap(i % 10) for i, g in enumerate(group_keys)}
+            import pdb; pdb.set_trace()
             for keys, g in groups:
                 keys_tuple = (keys,) if len(group_cols) == 1 else keys
                 label = ", ".join(_short_label(c, v) for c, v in zip(group_cols, keys_tuple))
