@@ -312,6 +312,46 @@ class CNNImageDecoder(nn.Module):
         return torch.tanh(x)
 
 
+class CPCContextEncoder(nn.Module):
+    """
+    Context encoder for Contrastive Predictive Coding (CPC).
+
+    Aggregates a sequence of encoder embeddings into a context vector using a GRU.
+    Used to predict future latent representations from past context.
+
+    Args:
+        embedding_size: Size of input embeddings from the encoder.
+        hidden_size: Hidden size of the GRU. Defaults to embedding_size.
+    """
+
+    def __init__(
+        self,
+        embedding_size: int,
+        hidden_size: int | None = None,
+    ):
+        super().__init__()
+        self.embedding_size = embedding_size
+        self.hidden_size = hidden_size or embedding_size
+
+        self.gru = nn.GRU(
+            input_size=embedding_size,
+            hidden_size=self.hidden_size,
+            batch_first=True,
+        )
+
+    def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+
+        Args:
+            embeddings: Sequence of embeddings, shape (batch, seq_len, embedding_size).
+
+        Returns:
+            Context vectors, shape (batch, seq_len, hidden_size).
+        """
+        return self.gru(embeddings)[0]
+
+
 class StateClassifier(nn.Module):
     """
     Classifier that predicts source_id from normalized state.

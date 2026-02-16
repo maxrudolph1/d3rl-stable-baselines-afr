@@ -34,52 +34,6 @@ from afr.networks import get_encoder_factory
 
 
 def main():
-    # parser = argparse.ArgumentParser(
-    #     description="CARDPOL encoder pre-training. Pass a data config YAML with --data-config."
-    # )
-    # parser.add_argument(
-    #     "--data-config",
-    #     type=str,
-    #     required=True,
-    #     help="Path to YAML config with keys: environment, data (list of path/label), validation_data.",
-    # )
-    # parser.add_argument(
-    #     "--log-dir",
-    #     type=str,
-    #     default="artifacts",
-    #     help="Directory for logs and checkpoints.",
-    # )
-    # parser.add_argument(
-    #     "--device",
-    #     type=str,
-    #     default="cuda:0",
-    #     help="Device to use for training.",
-    # )
-    # parser.add_argument(
-    #     "--n-steps",
-    #     type=int,
-    #     default=10000,
-    #     help="Number of pre-training steps.",
-    # )
-    # parser.add_argument(
-    #     "--batch-size",
-    #     type=int,
-    #     default=512,
-    #     help="Batch size for training.",
-    # )
-    # parser.add_argument(
-    #     "--no-wandb",
-    #     action="store_true",
-    #     help="Disable wandb logging.",
-    # )
-    
-    # parser.add_argument(
-    #     "--group",
-    #     type=str,
-    #     default="default",
-    #     help="Group name for logging.",
-    # )
-    # args = parser.parse_args()
     
     args = OmegaConf.from_cli()
     data_config_path = args.data_config
