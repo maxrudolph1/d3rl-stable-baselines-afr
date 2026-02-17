@@ -72,8 +72,13 @@ class EncoderPretrainConfig:
     state_classifier_hidden_sizes: list = None  # Default: [256, 128]
     state_classifier_loss_weight: float = 1.0  # Weight for state classifier cross-entropy loss
 
+    # VQVAE baseline configuration (use as main pretraining loss instead of CARDPOL)
+    use_vqvae: bool = False  # If True, use VQVAE loss and create quantizer+decoder instead of classifier
+    vqvae_num_embeddings: int = 512  # Codebook size
+    vqvae_commitment_cost: float = 0.25  # Beta for commitment loss
+
     # CNN image decoder configuration (reconstructs first channel from representation; no grad through encoder)
-    use_image_decoder: bool = True  # Whether to train a CNN decoder that predicts first channel from representation
+    use_image_decoder: bool = True  # Whether to train a CNN decoder when not using VQVAE
     image_decoder_learning_rate: float = 1e-3
     image_decoder_loss_weight: float = 1.0  # Weight for image decoder MSE loss
     image_decoder_log_interval: int = 500  # How often to log input/output images to wandb (0 to disable)

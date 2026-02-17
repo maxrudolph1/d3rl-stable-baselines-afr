@@ -10,19 +10,14 @@
 #   - A dict with "path" and optional "label" (defaults to index 0, 1, 2, ...)
 #   - A string (path only; label defaults to index)
 
-environment: "BreakoutNoFrameskip-v4"
-
-# Dimension of normalized_state (after filtering low-variance columns); state is always 128.
-normalized_state_dim: 17
-
+environment: "QbertNoFrameskip-v4"
+normalized_state_dim: 128
+num_actions: 18
 data:
-  - path: "atari_data/BreakoutNoFrameskip-v4/dqn/ckpt_0_100000.pth"
+
+  - path: "atari_data/resets/QbertNoFrameskip-v4/dqn/ckpt_7_10000.pth"
     label: 0
-  - path: "atari_data/BreakoutNoFrameskip-v4/dqn/ckpt_7_100000.pth"
-    label: 1
 
 validation_data:
-  - path: "atari_data/BreakoutNoFrameskip-v4/dqn/ckpt_0_10000.pth"
+  - path: "atari_data/resets/QbertNoFrameskip-v4/dqn/ckpt_7_10000.pth"
     label: 0
-  - path: "atari_data/BreakoutNoFrameskip-v4/dqn/ckpt_9_10000.pth"
-    label: 1

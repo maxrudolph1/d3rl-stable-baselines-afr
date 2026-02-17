@@ -312,6 +312,168 @@ class CNNImageDecoder(nn.Module):
         return torch.tanh(x)
 
 
+class VectorQuantizer(nn.Module):
+    """
+    Vector Quantizer for VQVAE.
+
+    Maps continuous encoder outputs to discrete codes via nearest-neighbor lookup
+    in a learnable codebook. Uses straight-through estimator for gradients.
+
+    Args:
+        num_embeddings: Number of codebook entries (K).
+        embedding_dim: Dimension of each codebook entry (must match encoder output).
+    """
+
+    def __init__(self, num_embeddings: int, embedding_dim: int):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+
+        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
+        self.embedding.weight.data.uniform_(-1.0 / num_embeddings, 1.0 / num_embeddings)
+
+    def forward(
+        self, z: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Quantize continuous latent z to nearest codebook entry.
+
+        Args:
+            z: Continuous latent from encoder, shape (batch, embedding_dim).
+
+        Returns:
+            Tuple of (z_q, indices, codebook_loss, commitment_loss) where:
+            - z_q: Quantized latent (for decoder input), shape (batch, embedding_dim).
+            - indices: Codebook indices, shape (batch,).
+            - codebook_loss: ||sg[z] - z_q||^2 (codebook moves toward encoder).
+            - commitment_loss: ||z - sg[z_q]||^2 (encoder commits to codebook).
+        """
+        # Flatten if needed: (B, D) -> (B, D)
+        d = z.shape[-1]
+        z_flat = z.view(-1, d)
+
+        # L2 distance to codebook: (B, K)
+        distances = (
+            torch.sum(z_flat**2, dim=1, keepdim=True)
+            + torch.sum(self.embedding.weight**2, dim=1)
+            - 2 * torch.matmul(z_flat, self.embedding.weight.t())
+        )
+
+        # Find nearest codebook entry
+        indices = torch.argmin(distances, dim=1)
+        z_q = self.embedding(indices)  # (B, D)
+
+        # Codebook loss: ||sg[z] - z_q||^2 (gradients to codebook only)
+        codebook_loss = torch.nn.functional.mse_loss(z_flat.detach(), z_q)
+
+        # Commitment loss: ||z - sg[z_q]||^2 (gradients to encoder only)
+        commitment_loss = torch.nn.functional.mse_loss(z_flat, z_q.detach())
+
+        # Straight-through: copy gradients from z_q to z for reconstruction flow
+        z_q = z_flat + (z_q - z_flat).detach()
+
+        # Reshape z_q to match input shape
+        z_q = z_q.view(*z.shape)
+        indices = indices.view(*z.shape[:-1])
+
+        return z_q, indices, codebook_loss, commitment_loss
+
+
+class VQVAEDecoder(nn.Module):
+    """
+    CNN decoder for VQVAE that reconstructs the first channel from quantized latent.
+
+    Same architecture as CNNImageDecoder: takes a flat latent vector and produces
+    a single-channel image. Used in VQVAE to reconstruct observations.
+
+    Args:
+        embedding_size: Size of the quantized latent (matches encoder output).
+        observation_shape: (C, H, W) of the input observations. Output will be (1, H, W).
+    """
+
+    def __init__(self, embedding_size: int, observation_shape: tuple):
+        super().__init__()
+        self.embedding_size = embedding_size
+        self.observation_shape = observation_shape
+        _, h, w = observation_shape
+
+        latent_h, latent_w = 7, 7
+        latent_channels = 64
+
+        self.linear = nn.Linear(embedding_size, latent_channels * latent_h * latent_w)
+
+        self.deconv = nn.Sequential(
+            nn.ConvTranspose2d(latent_channels, 64, 4, 2, 1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(64, 32, 4, 2, 1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, 1, 4, 2, 1),
+        )
+        self._target_h, self._target_w = h, w
+        self._needs_resize = h != 56 or w != 56
+
+    def forward(self, z_q: torch.Tensor) -> torch.Tensor:
+        """
+        Decode quantized latent to reconstructed image.
+
+        Args:
+            z_q: Quantized latent, shape (batch_size, embedding_size).
+
+        Returns:
+            Reconstructed first channel, shape (batch_size, 1, H, W). Values in [-1, 1].
+        """
+        x = self.linear(z_q)
+        x = x.view(x.shape[0], 64, 7, 7)
+        x = self.deconv(x)
+        if self._needs_resize:
+            x = torch.nn.functional.interpolate(
+                x, size=(self._target_h, self._target_w),
+                mode="bilinear", align_corners=False
+            )
+        return torch.tanh(x)
+
+
+class VQVAEAuxiliary(nn.Module):
+    """
+    Auxiliary module for VQVAE baseline: wraps VectorQuantizer and VQVAEDecoder.
+
+    Used as the 'classifier' argument in EncoderPretrainer when using VQVAE loss.
+    Provides a unified interface for the quantizer and decoder.
+    """
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        num_embeddings: int,
+        observation_shape: tuple,
+    ):
+        super().__init__()
+        self.quantizer = VectorQuantizer(
+            num_embeddings=num_embeddings,
+            embedding_dim=embedding_dim,
+        )
+        self.decoder = VQVAEDecoder(
+            embedding_size=embedding_dim,
+            observation_shape=observation_shape,
+        )
+
+    def forward(
+        self, z: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Quantize and decode.
+
+        Args:
+            z: Encoder output, shape (batch, embedding_dim).
+
+        Returns:
+            Tuple of (reconstruction, indices, codebook_loss, commitment_loss).
+        """
+        z_q, indices, codebook_loss, commitment_loss = self.quantizer(z)
+        recon = self.decoder(z_q)
+        return recon, indices, codebook_loss, commitment_loss
+
+
 class CPCContextEncoder(nn.Module):
     """
     Context encoder for Contrastive Predictive Coding (CPC).

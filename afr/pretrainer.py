@@ -24,9 +24,24 @@ except ImportError:
 
 import d3rlpy
 
-from afr.networks import CARDPOLClassifier, BehaviorCloningHead, StateDecoderHead, StateClassifier, CNNImageDecoder
+from afr.networks import (
+    CARDPOLClassifier,
+    BehaviorCloningHead,
+    StateDecoderHead,
+    StateClassifier,
+    CNNImageDecoder,
+    VQVAEAuxiliary,
+)
 from afr.extended_dataset import CombinedMDPDataset, TrajectoryBatchWithSource
-from afr.losses import cardpol_loss, bc_loss, state_decoder_loss, state_classifier_loss, image_decoder_loss, normalize_pixel_obs
+from afr.losses import (
+    cardpol_loss,
+    bc_loss,
+    state_decoder_loss,
+    state_classifier_loss,
+    image_decoder_loss,
+    vqvae_loss,
+    normalize_pixel_obs,
+)
 
 
 class EncoderPretrainer:
@@ -95,16 +110,29 @@ class EncoderPretrainer:
         # Get encoder feature size
         encoder_feature_size = self._compute_encoder_feature_size()
 
-        # Create or use provided classifier
-        if classifier is not None:
-            self.classifier = classifier.to(self.device)
+        self.use_vqvae = config.use_vqvae
+
+        # Create or use provided classifier / VQVAE auxiliary
+        if config.use_vqvae:
+            obs_shape = tuple(self.cql._impl.observation_shape)
+            if classifier is not None and isinstance(classifier, VQVAEAuxiliary):
+                self.classifier = classifier.to(self.device)
+            else:
+                self.classifier = VQVAEAuxiliary(
+                    embedding_dim=encoder_feature_size,
+                    num_embeddings=config.vqvae_num_embeddings,
+                    observation_shape=obs_shape,
+                ).to(self.device)
         else:
-            self.classifier = CARDPOLClassifier(
-                embedding_size=encoder_feature_size,
-                num_sources=config.num_sources,
-                hidden_sizes=config.classifier_hidden_sizes,
-                combine_mode=config.classifier_combine_mode,
-            ).to(self.device)
+            if classifier is not None:
+                self.classifier = classifier.to(self.device)
+            else:
+                self.classifier = CARDPOLClassifier(
+                    embedding_size=encoder_feature_size,
+                    num_sources=config.num_sources,
+                    hidden_sizes=config.classifier_hidden_sizes,
+                    combine_mode=config.classifier_combine_mode,
+                ).to(self.device)
 
         # Create or use provided BC head (if enabled)
         self.bc_head = None
@@ -157,10 +185,10 @@ class EncoderPretrainer:
                 lr=config.state_classifier_learning_rate,
             )
 
-        # Create or use provided image decoder (if enabled)
+        # Create or use provided image decoder (if enabled; skipped when using VQVAE)
         self.image_decoder = None
         self.image_decoder_optimizer = None
-        if config.use_image_decoder:
+        if config.use_image_decoder and not config.use_vqvae:
             obs_shape = tuple(self.cql._impl.observation_shape)
             if image_decoder is not None:
                 self.image_decoder = image_decoder.to(self.device)
@@ -186,8 +214,16 @@ class EncoderPretrainer:
             lr=config.classifier_learning_rate
         )
 
-        # Loss function (user-defined or default pairwise source prediction)
-        self.loss_fn = loss_fn or cardpol_loss
+        # Loss function (user-defined or default based on method)
+        if loss_fn is not None:
+            self.loss_fn = loss_fn
+        elif config.use_vqvae:
+            self.loss_fn = lambda enc, aux, batch, ids, dev: vqvae_loss(
+                enc, aux, batch, ids, dev,
+                commitment_cost=config.vqvae_commitment_cost,
+            )
+        else:
+            self.loss_fn = cardpol_loss
 
         # Logging
         self.writer = SummaryWriter(f"{config.log_dir}/{config.group}")
@@ -229,6 +265,9 @@ class EncoderPretrainer:
                 "use_image_decoder": config.use_image_decoder,
                 "image_decoder_learning_rate": config.image_decoder_learning_rate,
                 "image_decoder_loss_weight": config.image_decoder_loss_weight,
+                "use_vqvae": config.use_vqvae,
+                "vqvae_num_embeddings": config.vqvae_num_embeddings,
+                "vqvae_commitment_cost": config.vqvae_commitment_cost,
                 "group": config.group,
             }
             wandb.init(
@@ -346,7 +385,10 @@ class EncoderPretrainer:
         self.classifier_optimizer.step()
 
         # Collect metrics
-        all_metrics["cardpol_loss"] = cardpol_loss_val.item()
+        if self.use_vqvae:
+            all_metrics["vqvae_loss"] = cardpol_loss_val.item()
+        else:
+            all_metrics["cardpol_loss"] = cardpol_loss_val.item()
         all_metrics.update(metrics)
 
         # Compute BC loss if BC head is enabled
@@ -474,6 +516,10 @@ class EncoderPretrainer:
         state_classifier_total_correct = 0
         state_classifier_total_samples = 0
 
+        # VQVAE validation metrics
+        vqvae_total_mae = 0.0
+        vqvae_n_batches = 0
+
         for _ in range(self.config.val_n_batches):
             # Sample validation batch
             batch_with_source = self.val_combined_dataset.sample_trajectory_batch(
@@ -487,7 +533,8 @@ class EncoderPretrainer:
             actions = trajectory_batch.actions
             batch_size, seq_len = observations.shape[:2]
 
-            if seq_len < 2:
+            min_seq_len = 2 if not self.use_vqvae else 1
+            if seq_len < min_seq_len:
                 continue
 
             # Convert to tensor if numpy array
@@ -499,32 +546,45 @@ class EncoderPretrainer:
             # Get observation at t=0 for all trajectories and normalize
             obs_t0 = normalize_pixel_obs(observations[:, 0].to(self.device))
 
-            # Sample random timesteps
-            random_t = torch.randint(1, seq_len, (batch_size,))
-            obs_t_random = normalize_pixel_obs(
-                observations[torch.arange(batch_size), random_t].to(self.device)
-            )
-
-            # Encode observations
+            # Encode for BC and CARDPOL (when not use_vqvae)
             embedding_t0 = self.encoders[0](obs_t0)
-            embedding_t_random = self.encoders[0](obs_t_random)
 
-            # Get CARDPOL predictions
-            logits = self.classifier(embedding_t0, embedding_t_random)
-            labels = torch.tensor(source_ids, dtype=torch.long, device=self.device)
+            if self.use_vqvae:
+                # VQVAE validation: compute reconstruction metrics
+                _, vqvae_metrics = vqvae_loss(
+                    encoder=self.encoders[0],
+                    vqvae_aux=self.classifier,
+                    trajectory_batch=trajectory_batch,
+                    source_ids=source_ids,
+                    device=self.device,
+                    commitment_cost=self.config.vqvae_commitment_cost,
+                )
+                vqvae_total_mae += vqvae_metrics["vqvae_mae"]
+                vqvae_n_batches += 1
+            else:
+                # Sample random timesteps for CARDPOL
+                random_t = torch.randint(1, seq_len, (batch_size,))
+                obs_t_random = normalize_pixel_obs(
+                    observations[torch.arange(batch_size), random_t].to(self.device)
+                )
+                embedding_t_random = self.encoders[0](obs_t_random)
 
-            # Compute CARDPOL loss
-            loss = nn.functional.cross_entropy(logits, labels)
-            total_loss += loss.item() * batch_size
+                # Get CARDPOL predictions
+                logits = self.classifier(embedding_t0, embedding_t_random)
+                labels = torch.tensor(source_ids, dtype=torch.long, device=self.device)
 
-            # Compute CARDPOL accuracy
-            predictions = torch.argmax(logits, dim=-1)
-            total_correct += (predictions == labels).sum().item()
-            total_samples += batch_size
+                # Compute CARDPOL loss
+                loss = nn.functional.cross_entropy(logits, labels)
+                total_loss += loss.item() * batch_size
 
-            # Store for per-class metrics
-            all_predictions.extend(predictions.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+                # Compute CARDPOL accuracy
+                predictions = torch.argmax(logits, dim=-1)
+                total_correct += (predictions == labels).sum().item()
+                total_samples += batch_size
+
+                # Store for per-class metrics
+                all_predictions.extend(predictions.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
 
             # Compute BC validation metrics if BC head is enabled
             if self.bc_head is not None:
@@ -595,23 +655,30 @@ class EncoderPretrainer:
         if self.image_decoder is not None:
             self.image_decoder.train()
 
-        if total_samples == 0:
+        if total_samples == 0 and not self.use_vqvae:
             return {"val_accuracy": 0.0, "val_loss": 0.0}
 
-        val_metrics = {
-            "val_accuracy": total_correct / total_samples,
-            "val_loss": total_loss / total_samples,
-        }
+        val_metrics = {}
+        if self.use_vqvae:
+            # VQVAE validation: use reconstruction MAE if we have any batches
+            val_metrics["val_vqvae_mae"] = (
+                vqvae_total_mae / vqvae_n_batches
+                if vqvae_n_batches > 0
+                else 0.0
+            )
+        else:
+            val_metrics["val_accuracy"] = total_correct / total_samples
+            val_metrics["val_loss"] = total_loss / total_samples
 
-        # Compute per-class accuracy if we have enough data
-        all_predictions = np.array(all_predictions)
-        all_labels = np.array(all_labels)
-
-        for source_id in range(self.config.num_sources):
-            mask = all_labels == source_id
-            if mask.sum() > 0:
-                class_acc = (all_predictions[mask] == source_id).mean()
-                val_metrics[f"val_accuracy_source_{source_id}"] = class_acc
+        # Compute per-class accuracy if we have enough data (CARDPOL only)
+        if not self.use_vqvae and len(all_predictions) > 0:
+            all_predictions = np.array(all_predictions)
+            all_labels = np.array(all_labels)
+            for source_id in range(self.config.num_sources):
+                mask = all_labels == source_id
+                if mask.sum() > 0:
+                    class_acc = (all_predictions[mask] == source_id).mean()
+                    val_metrics[f"val_accuracy_source_{source_id}"] = class_acc
 
         # Add BC validation metrics
         if self.bc_head is not None and bc_total_samples > 0:
@@ -672,6 +739,34 @@ class EncoderPretrainer:
             table.add_data(wandb.Image(inp), wandb.Image(out))
         wandb.log({"image_decoder/input_vs_output": table}, step=step)
 
+    @torch.no_grad()
+    def _log_vqvae_samples(self, step: int, n_samples: int = 8) -> None:
+        """Sample a batch, run encoder+VQVAE, and log input/output images to wandb."""
+        if not WANDB_AVAILABLE or not self.use_wandb or not self.use_vqvae:
+            return
+        batch_with_source = self.combined_dataset.sample_trajectory_batch(
+            batch_size=n_samples, length=1
+        )
+        trajectory_batch = batch_with_source.batch
+        observations = trajectory_batch.observations
+        if isinstance(observations, np.ndarray):
+            observations = torch.from_numpy(observations)
+        obs = observations[:, 0].to(self.device)
+        obs_norm = normalize_pixel_obs(obs)
+        z = self.encoders[0](obs_norm)
+        pred, _, _, _ = self.classifier(z)
+        target = obs_norm[:, :1]
+
+        def to_uint8(x: torch.Tensor) -> np.ndarray:
+            return ((x.cpu().numpy() + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
+
+        input_imgs = to_uint8(target)
+        output_imgs = to_uint8(pred)
+        table = wandb.Table(columns=["Input (first channel)", "VQVAE Reconstructed"])
+        for i in range(min(n_samples, input_imgs.shape[0])):
+            table.add_data(wandb.Image(input_imgs[i, 0]), wandb.Image(output_imgs[i, 0]))
+        wandb.log({"vqvae/input_vs_output": table}, step=step)
+
     def pretrain(self) -> None:
         """Run the full pre-training loop."""
         print(f"Starting encoder pre-training for {self.config.n_steps} steps...")
@@ -693,12 +788,15 @@ class EncoderPretrainer:
             print(f"  NOTE: State decoder gradients do NOT backpropagate to encoder")
         if self.state_classifier is not None:
             print(f"State classifier enabled: normalized_state_dim={self.config.normalized_state_dim}, weight={self.config.state_classifier_loss_weight}")
+        if self.use_vqvae:
+            print(f"VQVAE baseline: num_embeddings={self.config.vqvae_num_embeddings}, commitment_cost={self.config.vqvae_commitment_cost}")
         if self.image_decoder is not None:
             print(f"Image decoder enabled: predicts first channel, weight={self.config.image_decoder_loss_weight}, log every {self.config.image_decoder_log_interval} steps")
             print(f"  NOTE: Image decoder gradients do NOT backpropagate to encoder")
         print("-" * 50)
 
         best_val_accuracy = 0.0
+        best_val_vqvae_mae = float("inf")
         for step in range(1, self.config.n_steps + 1):
             metrics = self.pretrain_step()
 
@@ -710,13 +808,12 @@ class EncoderPretrainer:
             if self.use_wandb:
                 wandb.log({f"train/{k}": v for k, v in metrics.items()}, step=step)
 
-                # Log input/output images from image decoder periodically
-                if (
-                    self.image_decoder is not None
-                    and self.config.image_decoder_log_interval > 0
-                    and step % self.config.image_decoder_log_interval == 0
-                ):
-                    self._log_image_decoder_samples(step)
+                # Log input/output images periodically
+                if self.config.image_decoder_log_interval > 0 and step % self.config.image_decoder_log_interval == 0:
+                    if self.use_vqvae:
+                        self._log_vqvae_samples(step)
+                    elif self.image_decoder is not None:
+                        self._log_image_decoder_samples(step)
 
             # Run validation
             if (self.config.val_interval > 0 and
@@ -730,8 +827,14 @@ class EncoderPretrainer:
                 if self.use_wandb:
                     wandb.log({f"val/{k}": v for k, v in val_metrics.items()}, step=step)
 
-                    # Track best validation accuracy
-                    if val_metrics.get("val_accuracy", 0) > best_val_accuracy:
+                    # Track best validation metric
+                    if self.use_vqvae:
+                        vqvae_mae = val_metrics.get("val_vqvae_mae", float("inf"))
+                        if vqvae_mae < best_val_vqvae_mae:
+                            best_val_vqvae_mae = vqvae_mae
+                            wandb.run.summary["best_val_vqvae_mae"] = best_val_vqvae_mae
+                            wandb.run.summary["best_val_step"] = step
+                    elif val_metrics.get("val_accuracy", 0) > best_val_accuracy:
                         best_val_accuracy = val_metrics["val_accuracy"]
                         wandb.run.summary["best_val_accuracy"] = best_val_accuracy
                         wandb.run.summary["best_val_step"] = step
@@ -808,11 +911,19 @@ class EncoderPretrainer:
 
         if include_classifier:
             state_dict["classifier"] = self.classifier.state_dict()
-            state_dict["classifier_config"] = {
-                "embedding_size": self.classifier.embedding_size,
-                "num_sources": self.classifier.num_sources,
-                "combine_mode": self.classifier.combine_mode,
-            }
+            if self.use_vqvae:
+                state_dict["classifier_config"] = {
+                    "use_vqvae": True,
+                    "embedding_dim": self.classifier.quantizer.embedding_dim,
+                    "num_embeddings": self.classifier.quantizer.num_embeddings,
+                    "observation_shape": self.classifier.decoder.observation_shape,
+                }
+            else:
+                state_dict["classifier_config"] = {
+                    "embedding_size": self.classifier.embedding_size,
+                    "num_sources": self.classifier.num_sources,
+                    "combine_mode": self.classifier.combine_mode,
+                }
 
         if include_bc_head and self.bc_head is not None:
             state_dict["bc_head"] = self.bc_head.state_dict()

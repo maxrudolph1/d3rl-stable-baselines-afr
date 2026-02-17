@@ -388,6 +388,81 @@ def bc_loss(
     return loss, metrics
 
 
+def vqvae_loss(
+    encoder: nn.Module,
+    vqvae_aux: nn.Module,
+    trajectory_batch: TrajectoryMiniBatch,
+    source_ids: np.ndarray,
+    device: str = "cuda:0",
+    commitment_cost: float = 0.25,
+) -> tuple:
+    """
+    VQ-VAE (Vector Quantized Variational Autoencoder) loss.
+
+    Trains the encoder to produce representations that can be quantized to a
+    discrete codebook and reconstructed back to the input. Uses reconstruction
+    loss (MSE on first channel), codebook loss, and commitment loss.
+
+    The classifier parameter is replaced by vqvae_aux (VQVAEAuxiliary containing
+    quantizer and decoder). source_ids is unused (kept for API compatibility).
+
+    Args:
+        encoder: The encoder network to train.
+        vqvae_aux: VQVAEAuxiliary (quantizer + decoder) module.
+        trajectory_batch: Batch of trajectories.
+        source_ids: Unused; kept for API compatibility.
+        device: Device to run computations on.
+        commitment_cost: Weight for commitment loss (beta in paper). Default 0.25.
+
+    Returns:
+        Tuple of (loss, metrics_dict).
+    """
+    observations = trajectory_batch.observations  # (B, L, *obs_shape)
+    masks = trajectory_batch.masks  # (B, L)
+
+    if isinstance(observations, np.ndarray):
+        observations = torch.from_numpy(observations)
+    if isinstance(masks, np.ndarray):
+        masks = torch.from_numpy(masks)
+
+    # Flatten to (B*L, *obs_shape)
+    obs_flat = observations.reshape(-1, *observations.shape[2:])
+    masks_flat = masks.reshape(-1)
+
+    obs_flat = normalize_pixel_obs(obs_flat.to(device))
+    masks_flat = masks_flat.to(device)
+
+    # Target: first channel only, shape (B*L, 1, H, W)
+    target_first_channel = obs_flat[:, :1]
+
+    # Encode
+    z = encoder(obs_flat)  # (B*L, embedding_dim)
+
+    # Quantize and decode
+    recon, indices, codebook_loss, commitment_loss = vqvae_aux(z)
+
+    # Reconstruction loss (MSE on first channel, masked)
+    diff = (recon - target_first_channel) * masks_flat.view(-1, 1, 1, 1)
+    n_pixels = recon.shape[1] * recon.shape[2] * recon.shape[3]
+    n_valid = masks_flat.sum() * n_pixels + 1e-8
+    reconstruction_loss = (diff ** 2).sum() / n_valid
+
+    # Total loss: recon + codebook + beta * commitment
+    loss = reconstruction_loss + codebook_loss + commitment_cost * commitment_loss
+
+    with torch.no_grad():
+        mae_per_frame = diff.abs().mean(dim=(1, 2, 3)) * masks_flat
+        mae = mae_per_frame.sum() / (masks_flat.sum() + 1e-8)
+
+    metrics = {
+        "vqvae_reconstruction_loss": reconstruction_loss.item(),
+        "vqvae_codebook_loss": codebook_loss.item(),
+        "vqvae_commitment_loss": commitment_loss.item(),
+        "vqvae_mae": mae.item(),
+    }
+    return loss, metrics
+
+
 def state_decoder_loss(
     encoder: nn.Module,
     state_decoder: StateDecoderHead,
