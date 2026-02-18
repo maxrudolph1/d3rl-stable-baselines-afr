@@ -33,7 +33,8 @@ def main(dry_run: bool = False, sweep_configs: list = None, script: str = 'main.
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128GB
-#SBATCH --time=48:00:00
+#SBATCH --time=24:00:00
+#SBATCH --exclude=slurm-node-004
 
 source /scratch/cluster/mrudolph/miniconda3/etc/profile.d/conda.sh
 conda activate rlzoo

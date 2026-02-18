@@ -36,9 +36,17 @@ class DataConfig:
     normalized_state_dim: int | None = None  # From data YAML; dimension of normalized_state after filtering.
     num_actions: int | None = None  # Number of discrete actions (required if use_bc_head=True)
     
+# Valid encoder pretraining methods. Each has its own loss and optional auxiliary module.
+ENCODER_PRETRAIN_METHODS = ("cardpol", "vqvae", "curl")
+
+
 @dataclass
 class EncoderPretrainConfig:
-    """Configuration for encoder pre-training."""
+    """Configuration for encoder pre-training. Use 'method' to select loss (cardpol, vqvae, curl)."""
+
+    # Main pretraining method: which loss to use for encoder training
+    method: str = "cardpol"  # One of: cardpol, vqvae, curl
+    use_vqvae: bool | None = None  # Deprecated: if True, overrides method to vqvae. Prefer method="vqvae".
 
     # Training
     learning_rate: float = 1e-4
@@ -47,16 +55,27 @@ class EncoderPretrainConfig:
     trajectory_length: int = 3
     n_steps: int = 100000
 
-    # Classifier configuration
+    # CARDPOL configuration (when method=cardpol)
     num_sources: int = 2
     classifier_hidden_sizes: list = None  # Default: [256, 128]
     classifier_combine_mode: str = "concat"  # 'concat', 'diff', or 'concat_diff'
 
-    # Behavior Cloning head configuration
-    use_bc_head: bool = True  # Whether to train a BC head alongside CARDPOL
+    # VQVAE configuration (when method=vqvae)
+    vqvae_num_embeddings: int = 512  # Codebook size
+    vqvae_commitment_cost: float = 0.25  # Beta for commitment loss
+
+    # CURL configuration (when method=curl)
+    curl_pad: int = 8  # Padding for random crop augmentation (84x84 Atari)
+    curl_temperature: float = 0.1  # Temperature for InfoNCE contrastive loss
+
+    # When True for encoder-only methods (vqvae, curl), disable BC/state_decoder/state_classifier
+    method_standalone: bool = True
+
+    # Behavior Cloning head configuration (auxiliary; disabled when method_standalone for vqvae/curl)
+    use_bc_head: bool = True  # Whether to train a BC head
     bc_learning_rate: float = 1e-3
     bc_hidden_sizes: list = None  # Default: [256, 128]
-    bc_loss_weight: float = 1.0  # Weight for BC loss relative to CARDPOL loss
+    bc_loss_weight: float = 1.0  # Weight for BC loss
     num_actions: int = None  # Number of discrete actions (required if use_bc_head=True)
 
     # State decoder head configuration (decodes normalized_state from representation; no grad through encoder)
@@ -72,13 +91,8 @@ class EncoderPretrainConfig:
     state_classifier_hidden_sizes: list = None  # Default: [256, 128]
     state_classifier_loss_weight: float = 1.0  # Weight for state classifier cross-entropy loss
 
-    # VQVAE baseline configuration (use as main pretraining loss instead of CARDPOL)
-    use_vqvae: bool = False  # If True, use VQVAE loss and create quantizer+decoder instead of classifier
-    vqvae_num_embeddings: int = 512  # Codebook size
-    vqvae_commitment_cost: float = 0.25  # Beta for commitment loss
-
-    # CNN image decoder configuration (reconstructs first channel from representation; no grad through encoder)
-    use_image_decoder: bool = True  # Whether to train a CNN decoder when not using VQVAE
+    # CNN image decoder configuration (reconstructs first channel; skipped when method=vqvae)
+    use_image_decoder: bool = True  # Whether to train a CNN decoder
     image_decoder_learning_rate: float = 1e-3
     image_decoder_loss_weight: float = 1.0  # Weight for image decoder MSE loss
     image_decoder_log_interval: int = 500  # How often to log input/output images to wandb (0 to disable)
@@ -115,6 +129,22 @@ class EncoderPretrainConfig:
             self.state_decoder_hidden_sizes = [256, 128]
         if self.state_classifier_hidden_sizes is None:
             self.state_classifier_hidden_sizes = [256, 128]
+        # Backward compat: use_vqvae=True -> method=vqvae
+        if self.use_vqvae:
+            self.method = "vqvae"
+
+        # Validate method
+        if self.method not in ENCODER_PRETRAIN_METHODS:
+            raise ValueError(
+                f"method must be one of {ENCODER_PRETRAIN_METHODS}, got {self.method}"
+            )
+
+        # When method_standalone for encoder-only methods, disable aux losses
+        if self.method_standalone and self.method in ("vqvae", "curl"):
+            self.use_bc_head = False
+            self.use_state_decoder = False
+            self.use_state_classifier = False
+
         if self.use_bc_head and self.num_actions is None:
             raise ValueError("num_actions must be specified when use_bc_head=True")
         if self.use_state_decoder and self.normalized_state_dim is None:

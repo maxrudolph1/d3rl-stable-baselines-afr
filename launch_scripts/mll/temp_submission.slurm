@@ -6,7 +6,8 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128GB
-#SBATCH --time=48:00:00
+#SBATCH --time=24:00:00
+#SBATCH --exclude=slurm-node-004
 
 source /scratch/cluster/mrudolph/miniconda3/etc/profile.d/conda.sh
 conda activate rlzoo
@@ -19,4 +20,4 @@ echo $SLURM_JOB_NODELIST
 echo "Job started at $(date)"
 echo "Running on node: $(hostname)"
 
-python -m afr.train_with_pretrained_encoder --data-config=afr/data_configs/spaceinvaders_post_small.yaml --log-dir=artifacts/offline_rl --seed=4 --encoder-weights=null --freeze-encoder=True --group=frozen_1k_SMALL_POST_TRAIN_02_17_2026 --eval-interval=100000
+python -m afr.train_with_pretrained_encoder --data-config=afr/data_configs/seaquest_post_small.yaml --log-dir=artifacts/offline_rl --seed=4 --encoder-weights=null --freeze-encoder=True --group=frozen_1k_SMALL_POST_TRAIN_02_17_2026 --eval-interval=100000

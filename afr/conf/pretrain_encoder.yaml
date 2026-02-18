@@ -1,6 +1,8 @@
-# Hydra config for CARDPOL encoder pre-training.
-# Override from CLI: python -m afr.pretrain_encoder data_config=afr/data_configs/breakout.yaml n_steps=5000
-# Or override data config path: python -m afr.pretrain_encoder data_config=path/to/data.yaml
+# Encoder pre-training config. Override method to swap loss: cardpol | vqvae | curl
+#
+# CARDPOL: python -m afr.pretrain_encoder data_config=afr/data_configs/breakout.yaml
+# VQVAE:   python -m afr.pretrain_encoder data_config=... method=vqvae
+# CURL:    python -m afr.pretrain_encoder data_config=... method=curl
 
 defaults: []
 
@@ -19,18 +21,36 @@ batch_size: 512
 no_wandb: false
 group: default
 
-# Encoder pretrain settings (passed to EncoderPretrainer as OmegaConf)
-pretrain:
-  learning_rate: 1.0e-4
-  classifier_learning_rate: 1.0e-4
-  trajectory_length: 10
-  classifier_hidden_sizes: [256, 128]
-  classifier_combine_mode: concat
-  log_interval: 100
-  save_interval: 2000
-  val_interval: 500
-  val_batch_size: 64
-  val_n_batches: 10
-  use_bc_head: false
-  use_state_decoder: false
-  # num_sources, num_actions, log_dir, device, group, use_wandb, wandb_* are set at runtime from top-level cfg
+# Encoder pretrain: method selects loss; method-specific params below
+method: cardpol  # cardpol | vqvae | curl
+method_standalone: true  # When true for vqvae/curl, disables BC/state_decoder/state_classifier
+
+# Shared
+learning_rate: 1.0e-4
+classifier_learning_rate: 1.0e-4
+trajectory_length: 10
+log_interval: 100
+save_interval: 2000
+val_interval: 500
+val_batch_size: 64
+val_n_batches: 10
+
+# CARDPOL (method=cardpol)
+num_sources: 2
+classifier_hidden_sizes: [256, 128]
+classifier_combine_mode: concat
+
+# VQVAE (method=vqvae)
+vqvae_num_embeddings: 512
+vqvae_commitment_cost: 0.25
+
+# CURL (method=curl)
+curl_pad: 8
+curl_temperature: 0.1
+
+# Auxiliary heads (disabled by default when method_standalone for vqvae/curl)
+use_bc_head: false
+use_state_decoder: false
+use_state_classifier: false
+use_image_decoder: true
+image_decoder_log_interval: 500

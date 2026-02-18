@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
 """
-CARDPOL: Contrastive Actor Recognition for Diverse POLicies
+Encoder pre-training: CARDPOL, VQVAE, or CURL.
 
-Main entry point for encoder pre-training using CARDPOL loss.
+Main entry point for encoder pre-training. Use 'method' in config to select:
+- cardpol: contrastive source prediction (default)
+- vqvae: vector-quantized reconstruction
+- curl: contrastive unsupervised representations (InfoNCE)
 
 Usage:
-    python -m afr.pretrain_encoder --data-config path/to/data_config.yaml
+    # CARDPOL (default):
+    python -m afr.pretrain_encoder data_config=path/to/data_config.yaml
 
-The config YAML must contain:
+    # VQVAE:
+    python -m afr.pretrain_encoder data_config=path/to/data_config.yaml method=vqvae
+
+    # CURL:
+    python -m afr.pretrain_encoder data_config=path/to/data_config.yaml method=curl
+
+The data config YAML must contain:
     environment: name of the environment (e.g. "QbertNoFrameskip-v4")
     data: list of {path: "...", label: 0} (or list of path strings; label defaults to index)
     validation_data: same structure for validation files
-
-See pretrain_data_config_example.yaml for an example config.
 """
 
 from omegaconf import OmegaConf
@@ -27,8 +35,7 @@ from d3rlpy.preprocessing import PixelObservationScaler, ClipRewardScaler
 
 from afr.config import load_data_config, EncoderPretrainConfig
 from afr.extended_dataset import CombinedMDPDataset
-from afr.losses import cardpol_loss
-from afr.pretrainer import EncoderPretrainConfig, EncoderPretrainer
+from afr.pretrainer import EncoderPretrainer
 from afr.utils import make_atari_env
 from afr.networks import get_encoder_factory
 
@@ -153,13 +160,13 @@ def main():
         **args,
         num_sources=len(datasets),
         log_dir=log_dir,
-        # Wandb settings
-        wandb_project="cardpol_atari_pretrain",
-        wandb_run_name=f"cardpol_{args.group}_{env_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-        wandb_tags=["cardpol", "encoder_pretrain", env_id],
+        wandb_project="encoder_pretrain",
         normalized_state_dim=normalized_state_dim,
         num_actions=num_actions,
     )
+    # Set wandb name/tags from resolved method (after use_vqvae compat in __post_init__)
+    config.wandb_run_name = f"{config.method}_{config.group}_{env_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    config.wandb_tags = [config.method, "encoder_pretrain", env_id]
     
     # Create CQL model
     print("Creating CQL model...")
@@ -191,12 +198,12 @@ def main():
         val_combined = None
         print("Validation dataset: none (no validation paths or files not found)\n")
 
-    # Create pre-trainer
+    # Create pre-trainer (loss_fn=None lets pretrainer select from config.method)
     pretrainer = EncoderPretrainer(
         cql=cql,
         combined_dataset=combined,
         config=config,
-        loss_fn=cardpol_loss,
+        loss_fn=None,
         val_combined_dataset=val_combined,
     )
 
@@ -204,10 +211,17 @@ def main():
     print(pretrainer.get_encoder(0))
     print(f"\nEncoder feature size: {pretrainer.get_encoder_feature_size()}")
 
-    print(f"\nClassifier architecture:")
-    print(pretrainer.classifier)
-    print(f"Number of sources: {config.num_sources}")
-    print(f"Combine mode: {config.classifier_combine_mode}")
+    if config.method == "vqvae":
+        print(f"\nVQVAE (quantizer + decoder):")
+        print(pretrainer.aux_module)
+        print(f"num_embeddings={config.vqvae_num_embeddings}, commitment_cost={config.vqvae_commitment_cost}")
+    elif config.method == "curl":
+        print(f"\nCURL (encoder-only): pad={config.curl_pad}, temperature={config.curl_temperature}")
+    else:
+        print(f"\nCARDPOL classifier:")
+        print(pretrainer.aux_module)
+        print(f"Number of sources: {config.num_sources}")
+        print(f"Combine mode: {config.classifier_combine_mode}")
 
     # Run pre-training
     print("\n" + "=" * 50)
